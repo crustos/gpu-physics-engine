@@ -14,6 +14,7 @@ A high-performance 2D physics engine built with Rust and wgpu, leveraging GPU co
 - **Verlet Integration**: Stable numerical integration for smooth particle motion
 - **Real-time Interaction**: Interactive particle spawning and mouse-based attraction forces
 - **Scalable**: Handle millions of particles with high framerates
+- **Crust / SPIR-V port**: every compute shader also builds from Rust-subset kernels to SPIR-V without rustc ([details](#-crust--spir-v-kernels-no-rustc-no-wgsl))
 
 ## 🎮 Controls
 
@@ -63,6 +64,53 @@ Every 4 seconds, the particles are sorted using morton codes to improve cache lo
 ### Current Limitations
 - **2D Only**: Currently supports 2D simulations
 - **Circle Shapes**: Only circular particles are supported at this time
+
+## 🦀 Crust / SPIR-V kernels (no rustc, no WGSL)
+
+Every compute shader also exists as a Rust-subset kernel in [`kernels/`](kernels), compiled straight to
+SPIR-V by [Crust](https://github.com/brentharts/crust) without rustc or cargo. The WGSL files stay the
+reference; the ports are checked against them.
+
+```bash
+python3 build.py --crust ../crust --status        # every WGSL shader and its port status
+python3 build.py --crust ../crust                 # compile kernels/*.rs to build/spirv/*.spv
+python3 build.py --crust ../crust --check         # ...and run each one against a Python model of the WGSL
+python3 build.py --crust ../crust --push-buffer --out DIR   # scalar parameters in a storage buffer (binding 30)
+```
+
+`--check` runs the compiled SPIR-V in Crust's reference interpreter (no GPU needed) and compares every
+output byte with a plain-Python model of the WGSL, including f32 rounding. `--push-buffer` builds need no
+push-constant device feature, which is what wgpu / WebGPU hosts use. Crust (`$CRUST_DIR` or `--crust`) is
+the only requirement.
+
+| Kernel file | Entry points | Origin |
+|---|---|---|
+| `home_cell_ids.rs`, `grid.rs` | `create_home_cell_ids`, `build_cell_ids_array` | ports of the grid shaders |
+| `particle_integration.rs`, `rearrange.rs` | `verlet_integration`, `rearrange` | ports |
+| `radix_sort.rs`, `prefix_sum.rs` | `build_histogram`, `scatter_keys`, `prefix_sum_of_each_block`, ... | ports (workgroup memory, barriers, atomics) |
+| `collision_cell_builder.rs`, `collision_solver.rs` | `count_objects_for_each_chunk`, `build_collision_cells_array`, `solve_collisions` | ports |
+| `prowl_world.rs` | `integrate_world`, `tile_collide` | added for [Prowl2D](https://github.com/crustos/Prowl2D): gravity and world box; circles against a grid of solid tiles |
+| `prowl_bodies.rs` | `solve_joints`, `solve_collisions_grouped`, `integrate_tagged`, `tile_friction`, `raycast`, `sensor_count` | added for Prowl2D: see below |
+
+### Beyond particles: bodies, joints, queries
+
+`prowl_bodies.rs` adds what a game needs on top of the circle solver, all still built from circles:
+
+- **Joints**: distance constraints between two circles or a circle and a fixed point (rigid, rope, strut,
+  spring), solved in colour batches so no circle appears twice in a dispatch. Ropes are chains of them.
+- **Groups**: circles of one body (the corner circles of a crate) ignore each other in
+  `solve_collisions_grouped`, so a **crate** is a grid of circles held by stiff joints.
+- **Tile friction**: slows circles touching a solid tile and absorbs part of the bounce (sand piles, crates stop sliding).
+- **Ray casts**: a batch of rays against the tile grid (exact grid walk) and all circles.
+- **Sensors**: counts of circles inside boxes or circles, filtered by a per-circle tag.
+
+Prowl2D drives all of this from Python through wgpu-py: see its `GPU.md`.
+
+### Current limits of the kernels
+
+- Circles only; boxes, ropes and joints are circles plus constraints, rounded at the corners.
+- Positions are interleaved `f32` pairs, y up; helper functions in the kernel language cannot take buffers.
+- The wgpu path of the Python host has been verified only on the reference interpreter so far.
 
 ## 📊 Performance
 
