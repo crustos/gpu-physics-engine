@@ -144,3 +144,17 @@ The engine demonstrates excellent scaling characteristics, maintaining smooth fr
 ---
 
 *Built with ❤️ using Rust and wgpu*
+
+## Crust `unity_pack --gpu-physics`
+
+`unity_glue.py` plus `runtime/` (`gpuphys.c/.h`, `gpk.py`) let Crust's `unity_pack` run a packed
+Unity project's Rigidbody2D / Collider2D physics on this engine's circle solver instead of Box2D:
+
+```
+python3 tools/unity_pack.py MyGame --gpu-physics path/to/gpu-physics-engine -o out
+```
+
+`gpk.py` translates the kernels to C with Crust; `gpuphys.c` runs them once per invocation on the CPU
+(the sort and prefix sum are plain C) behind a world-units API (`gpuphys.h`); `unity_glue.py` generates
+`physics_gpu.c`, which maps the Unity tables onto it. Supported and refused scenes are listed in
+Crust's `UNITY_PACK.md` ("GPU physics").
