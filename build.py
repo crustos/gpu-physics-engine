@@ -63,10 +63,12 @@ def find_crust(explicit):
 
 # ----------------------------------------------------------------- compile
 
-def compile_kernel(crust, src, out):
+def compile_kernel(crust, src, out, push_buffer=False):
     """Run Crust on one kernel file. Returns (ok, message, lowering notes)."""
     env = dict(os.environ)
     env["CRUST_SPIRV_REPORT"] = "1"
+    if push_buffer:
+        env["CRUST_SPIRV_PUSH"] = "buffer"
     env["PYTHONPATH"] = crust + os.pathsep + env.get("PYTHONPATH", "")
     cmd = [sys.executable, "-m", "shivyc.main", "--target", "spirv", src,
            "-o", out]
@@ -151,10 +153,16 @@ def main(argv):
                          "a Python model of the WGSL")
     ap.add_argument("--status", action="store_true",
                     help="list every WGSL shader and its port status")
+    ap.add_argument("--push-buffer", action="store_true",
+                    help="keep each kernel's scalar parameters in a read-only "
+                         "storage buffer (binding 30) instead of push "
+                         "constants: no device feature needed, and what the "
+                         "wgpu / WebGPU hosts use")
     ap.add_argument("--strict", action="store_true",
                     help="exit 1 while any compute shader is still unported")
     a = ap.parse_args(argv)
 
+    a.out = os.path.abspath(a.out)
     crust = find_crust(a.crust)
     os.makedirs(a.out, exist_ok=True)
 
@@ -178,7 +186,7 @@ def main(argv):
         out = os.path.join(a.out, name + ".spv")
         if os.path.exists(out):
             os.remove(out)
-        ok, msg, notes = compile_kernel(crust, src, out)
+        ok, msg, notes = compile_kernel(crust, src, out, a.push_buffer)
         if not ok:
             failed += 1
             print("  FAIL  %-24s" % (name + ".rs"))
@@ -203,6 +211,7 @@ def main(argv):
             built_entries[e["name"]] = name
         manifest[name] = {"file": name + ".spv", "entry_points": entries}
 
+    manifest["_meta"] = {"push_mode": "buffer" if a.push_buffer else "push_constants"}
     with open(os.path.join(a.out, "manifest.json"), "w") as fh:
         json.dump(manifest, fh, indent=2)
         fh.write("\n")
