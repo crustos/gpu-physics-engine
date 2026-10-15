@@ -150,6 +150,31 @@ slip speed `v.t - r*omega` through a per-circle `omega` binding of `tile_materia
 path (any `gp_body_set_material / filter / sensor` call), the legacy path still slows rolling balls. Polygons are rounded by their circle
 radius, and a coarse fill (a hexagon of 8 circles) rests within about 0.05 rad of a flat edge.
 
+### Smooth surfaces: quadratic Bezier colliders (`kernels/prowl_curves.rs`)
+
+Static curves that circles roll on, with no stair-stepping of a tile grid. A curve is a quadratic Bezier `p0 -> p1 (control) -> p2`
+(a straight segment is one with its control point halfway; longer outlines are several curves end to end).
+
+    gp_add_curve(w, x0,y0, x1,y1, x2,y2, friction, bounciness, side)     // C;  world.addCurve(...) in wasm and WebGPU
+
+* `side = 0`: a **thin wall**, solid on both faces (a ramp, a bowl, a bridge). A circle stays on the face it was on in the previous step.
+* `side = +1 / -1`: one edge of a **solid contour** whose inside is on the left / right of the direction `p0 -> p2` (a hill, a cave floor):
+  circles are pushed out of it, and a contour's curves share their end points.
+* `curve_collide` runs in the solver iterations after the tiles (nearest point on the curve by 9 samples and Newton steps, then a push to one radius);
+  `curve_material` runs after them and applies the contact's friction (geometric mean with the circle's), bounciness (the larger) and the slip, like `tile_material`.
+* A circle that moves more than its radius in one step can still tunnel, and a circle whose centre is deeper inside a solid contour than its radius is not pulled out.
+  Sensor bodies are blocked by curves. Adding a curve switches the world to the material kernels. Curves are static; Bezier-outlined moving bodies are not implemented.
+* Available in the C runtime (`gpuphys.c`), the wasm build and the WebGPU host; the Python host has no curve calls yet.
+
+#### Drawing the curves: `web/windfoil.js`
+
+A closed-form antialiased fill for quadratic outlines after [Windfoil](https://arxiv.org/abs/2610.02468) (DesLauriers): a pixel's coverage is the
+box-filtered winding number over its footprint, summed over curve pieces that are monotone in x and y, with the part of each piece inside the footprint's
+columns integrated exactly (a quartic in t). No sampling, so no noise. `Windfoil.create(device, format).setPath(path).draw(pass, {camera, scale, res, color, rule})`
+draws a path (a list of closed contours of `[x0,y0,x1,y1,x2,y2]` segments; rule `nonzero` or `evenodd`); pieces are binned in row bands, so a pixel only visits the
+pieces near its row. `node web/windfoil_test.mjs` checks the formula against supersampling on the CPU, and `web/check.py` renders shapes in headless Chromium and compares the pixels.
+Limits: the footprint is the axis-aligned pixel (no rotated or anisotropic filtering), and `pad` of `setPath` must be at least one pixel at the smallest zoom drawn.
+
 ### In the browser: WebAssembly and WebGPU
 
 Two ways to run the engine in a page; the first has every feature, the second has the speed.
