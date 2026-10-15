@@ -91,5 +91,15 @@ if (process.argv[2]) {
   const after = w4.readCircles(); const cx2 = [...Array(30).keys()].reduce((a, i) => a + after[3 * i], 0) / 30;
   check("a blast to the left pushes the sand right", pushed > 0 && cx2 > cx + 0.2, `moved ${(cx2 - cx).toFixed(2)}`);
 }
+{
+  const w5 = gp.createWorld({ width: 20, height: 10, gravity: [0, -9.81] });
+  check("a curve is added", w5.addCurve(4, 6, 10, 2, 16, 6, 0.4, 0, 0) === 0 && w5.curveCount === 1);
+  const b = w5.addBall(8, 8, 0.5);
+  for (let s = 0; s < 600; s++) w5.step(1 / 60);
+  const p = w5.bodyPose(b);
+  check("a ball rests in the bowl made of one Bezier curve", Math.abs(p.x - 10) < 1.2 && p.y > 4.45 && p.y < 4.75, `at (${p.x.toFixed(2)}, ${p.y.toFixed(2)})`);
+  w5.clearCurves();
+  check("clearCurves", w5.curveCount === 0);
+}
 console.log(failed ? failed + " FAILED" : "all checks passed");
 process.exit(failed ? 1 : 0);
