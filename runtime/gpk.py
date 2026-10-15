@@ -11,7 +11,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENGINE = os.path.dirname(HERE)
-KERNEL_FILES = ("grid", "collision_cell_builder", "prowl_world", "prowl_bodies")
+KERNEL_FILES = ("grid", "collision_cell_builder", "prowl_world", "prowl_bodies", "prowl_material")
 
 _ASSERT = re.compile(r"\s*assert\s+\w+\s+in\s+gpu\.\w+(?:\([^)]*\))?\s*,?")
 _ENTRY = re.compile(r"assert\s+(\w+)\s+in\s+gpu\.compute")
