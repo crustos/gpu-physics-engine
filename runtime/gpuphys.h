@@ -44,6 +44,8 @@ void gp_set_tiles( GpWorld *w, int width, int height, const unsigned *cells );
 int gp_add_ball( GpWorld *w, float x, float y, float radius, float vx, float vy, float dt );
 int gp_add_box( GpWorld *w, float x, float y, float width, float height, float angle, float vx, float vy,
 				float dt, float stiffness );
+int gp_add_sand( GpWorld *w, float x, float y, float radius, float vx, float vy, float dt ); /* a free circle (tag sand): returns its circle index, -1 when full */
+int gp_blast( GpWorld *w, float x, float y, float radius, float force ); /* pushes circles away: force = speed at the centre (units/s), linear to the edge */
 int gp_add_rope( GpWorld *w, float ax, float ay, float bx, float by, int segments, float radius, int pin_a, int pin_b );
 
 int gp_body_count( const GpWorld *w );

@@ -24,14 +24,14 @@ void solve_joints( float *positions, float *radius, unsigned int *joint_i, float
 				   unsigned int count );
 /* kernels/prowl_material.rs (gpk_prowl_material.c). Weak, so a host that links only the first four translated
  * kernel files still links; gp_body_set_material / gp_body_set_filter then return 0 and the step is the plain one. */
-void integrate_material( float *positions, float *previous, float *radius, float *material, float *inv_mass, float dt,
+void integrate_material( float *positions, float *previous, float *radius, float *material, float dt,
 						 float gx, float gy, float damping, float ww, float wh, unsigned int n ) __attribute__( ( weak ) );
 void solve_collisions_filtered( unsigned int *chunk_obj_count, unsigned int *collision_cells, unsigned int *cell_ids,
 								unsigned int *object_ids, float *positions, float *radius, unsigned int *uniform_data,
-								unsigned int *filter, float *material, float *inv_mass, float *previous,
+								unsigned int *filter, float *material, float *previous,
 								unsigned int color, float bounce_threshold ) __attribute__( ( weak ) );
 void tile_material( float *positions, float *previous, float *radius, unsigned int *tiles, float *material,
-					float *inv_mass, float *omega, unsigned int tw, unsigned int th, unsigned int n, float tile_friction,
+					float *omega, unsigned int tw, unsigned int th, unsigned int n, float tile_friction,
 					float tile_bounciness, float bounce_threshold ) __attribute__( ( weak ) );
 void raycast( float *positions, float *radius, unsigned int *groups, unsigned int *tiles, float *rays, float *hits,
 			  unsigned int *hit_ids, unsigned int tw, unsigned int th, unsigned int ncircles, unsigned int nrays,
@@ -122,7 +122,7 @@ struct GpWorld
 	int iterations;
 	float *pos, *prev, *rad;
 	unsigned *tags, *groups;
-	float *mat, *invm, *dens, *drag; /* per circle: material (4 floats), inverse mass, density scale, linear drag */
+	float *mat, *invm, *dens, *drag; /* per circle: material (5 floats: friction, bounciness, gravity scale, damping, inverse mass), inverse mass, density scale, linear drag */
 	unsigned *flt;                   /* per circle: category, mask, group, body (4 words) */
 	unsigned char *custom;           /* the circle's material was set (else it follows gp_set_material) */
 	float *omega;                    /* the spin of each circle (radians per step, 0 for one that does not turn): tile friction's slip */
@@ -192,7 +192,7 @@ GpWorld *gp_create( int capacity, int max_joints, float ox, float oy, float widt
 	w->tags = calloc( capacity, sizeof( unsigned ) );
 	w->groups = calloc( capacity, sizeof( unsigned ) );
 	w->owner = calloc( capacity, sizeof( int ) );
-	w->mat = calloc( 4 * capacity, sizeof( float ) );
+	w->mat = calloc( 5 * capacity, sizeof( float ) );
 	w->invm = calloc( capacity, sizeof( float ) );
 	w->dens = calloc( capacity, sizeof( float ) );
 	w->drag = calloc( capacity, sizeof( float ) );
@@ -267,7 +267,8 @@ static int add_circle( GpWorld *w, float x, float y, float r, float vx, float vy
 	w->tags[i] = tag;
 	w->groups[i] = group;
 	w->owner[i] = body;
-	w->mat[4 * i] = w->friction, w->mat[4 * i + 1] = 0.0f, w->mat[4 * i + 2] = 1.0f, w->mat[4 * i + 3] = 1.0f;
+	w->mat[5 * i] = w->friction, w->mat[5 * i + 1] = 0.0f, w->mat[5 * i + 2] = 1.0f, w->mat[5 * i + 3] = 1.0f;
+	w->mat[5 * i + 4] = 1.0f / ri;
 	w->invm[i] = 1.0f / ri, w->dens[i] = 1.0f, w->drag[i] = 0.0f, w->custom[i] = 0;
 	w->flt[4 * i] = 1u, w->flt[4 * i + 1] = 0xFFFFFFFFu, w->flt[4 * i + 2] = 0u, w->flt[4 * i + 3] = group;
 	memcpy( &w->uflt[4 * i], &w->flt[4 * i], 4 * sizeof( unsigned ) );
@@ -320,6 +321,36 @@ int gp_add_ball( GpWorld *w, float x, float y, float radius, float vx, float vy,
 	w->spin[b->c[0]] = 1;
 	b->w = b->h = 2 * radius;
 	return id;
+}
+
+/* A free circle, no body: sand. Returns its circle index (not a body id), or -1 when full. */
+int gp_add_sand( GpWorld *w, float x, float y, float radius, float vx, float vy, float dt )
+{
+	return add_circle( w, x, y, radius, vx, vy, dt, GP_TAG_SAND, 0, -1 );
+}
+
+/* Pushes every circle within `radius` of (x, y) away from it: `force` is the speed (units / s) it gives at the centre,
+ * falling off linearly to the edge. Returns how many circles were pushed. */
+int gp_blast( GpWorld *w, float x, float y, float radius, float force )
+{
+	float c = w->cell, px = ( x - w->ox ) / c, py = ( y - w->oy ) / c, rr = radius / c;
+	float dt = w->last_dt > 0 ? w->last_dt : 1.0f / 60;
+	int pushed = 0;
+	for ( int i = 0; i < w->n; ++i )
+	{
+		if ( w->frozen[i] || w->pinned[i] )
+			continue;
+		float dx = w->pos[2 * i] - px, dy = w->pos[2 * i + 1] - py, d = hypotf( dx, dy );
+		if ( d >= rr )
+			continue;
+		if ( d < 1e-4f )
+			dx = 0, dy = 1, d = 1;
+		float k = force * ( 1.0f - d / rr ) * dt / c / d;
+		w->prev[2 * i] -= dx * k;
+		w->prev[2 * i + 1] -= dy * k;
+		++pushed;
+	}
+	return pushed;
 }
 
 int gp_add_box( GpWorld *w, float x, float y, float bw, float bh, float angle, float vx, float vy, float dt,
@@ -672,9 +703,9 @@ int gp_body_set_material( GpWorld *w, int body, float friction, float bounciness
 	{
 		int c = b->c[k];
 		w->custom[c] = 1;
-		w->mat[4 * c] = 0.375f * ( friction < 0 ? 0 : friction );
-		w->mat[4 * c + 1] = bounciness < 0 ? 0 : ( bounciness > 1 ? 1 : bounciness );
-		w->mat[4 * c + 2] = gravity_scale;
+		w->mat[5 * c] = 0.375f * ( friction < 0 ? 0 : friction );
+		w->mat[5 * c + 1] = bounciness < 0 ? 0 : ( bounciness > 1 ? 1 : bounciness );
+		w->mat[5 * c + 2] = gravity_scale;
 		w->dens[c] = density > 0 ? density : 1.0f;
 		w->drag[c] = drag < 0 ? 0 : drag;
 	}
@@ -1514,7 +1545,7 @@ static void spin_end_step( GpWorld *w )
 		nx /= d, ny /= d;
 		float vt = ( w->pos[2 * i] - w->prev[2 * i] ) * -ny + ( w->pos[2 * i + 1] - w->prev[2 * i + 1] ) * nx;
 		float roll = vt / w->rad[i], om = w->ang[i] - w->prev_ang[i];
-		float mu = w->use_material ? sqrtf( w->mat[4 * i] * w->friction ) : w->friction;
+		float mu = w->use_material ? sqrtf( w->mat[5 * i] * w->friction ) : w->friction;
 		float grip = 5.0f * mu > 1.0f ? 1.0f : 5.0f * mu;
 		om += grip * ( roll - om );
 		w->prev_ang[i] = w->ang[i] - om;
@@ -1824,10 +1855,11 @@ void gp_step( GpWorld *w, float dt )
 		for ( int i = 0; i < n; ++i )
 		{
 			if ( !w->custom[i] )
-				w->mat[4 * i] = w->friction;
+				w->mat[5 * i] = w->friction;
 			float sand = w->tags[i] == 1 ? w->sand_damping / w->damping : 1.0f;
-			w->mat[4 * i + 3] = sand / ( 1.0f + w->drag[i] * dt );
+			w->mat[5 * i + 3] = sand / ( 1.0f + w->drag[i] * dt );
 			w->invm[i] = ( w->pinned[i] || w->frozen[i] ) ? 0.0f : 1.0f / ( w->rad[i] * w->dens[i] );
+			w->mat[5 * i + 4] = w->invm[i];
 			w->omega[i] = w->spin[i] ? w->ang[i] - w->prev_ang[i] : 0.0f;
 			memcpy( &w->flt[4 * i], &w->uflt[4 * i], 4 * sizeof( unsigned ) );
 			if ( w->sensor[i] )
@@ -1841,7 +1873,7 @@ void gp_step( GpWorld *w, float dt )
 				for ( int k = 0; k < b->nc; ++k )
 					w->omega[b->c[k]] = om;
 		}
-		GP_LAUNCH( n, integrate_material( w->pos, w->prev, w->rad, w->mat, w->invm, dt, w->gx, w->gy, w->damping, w->ww,
+		GP_LAUNCH( n, integrate_material( w->pos, w->prev, w->rad, w->mat, dt, w->gx, w->gy, w->damping, w->ww,
 										  w->wh, n ) );
 	}
 	else
@@ -1855,7 +1887,7 @@ void gp_step( GpWorld *w, float dt )
 			if ( mat )
 				GP_LAUNCH( w->last_ncells,
 						   solve_collisions_filtered( w->chunks, w->cells, w->cell_ids, w->object_ids, w->pos, w->rad,
-													  w->uniform, w->flt, w->mat, w->invm, w->prev, color,
+													  w->uniform, w->flt, w->mat, w->prev, color,
 													  w->bounce_threshold * dt / w->cell ) );
 			else
 			GP_LAUNCH( w->last_ncells,
@@ -1874,7 +1906,7 @@ void gp_step( GpWorld *w, float dt )
 		restore_pinned( w );
 	}
 	if ( w->tw && w->th && mat )
-		GP_LAUNCH( n, tile_material( w->pos, w->prev, w->rad, w->tiles, w->mat, w->invm, w->omega, w->tw, w->th, n, w->friction,
+		GP_LAUNCH( n, tile_material( w->pos, w->prev, w->rad, w->tiles, w->mat, w->omega, w->tw, w->th, n, w->friction,
 									 w->tile_bounce, w->bounce_threshold * dt / w->cell ) );
 	else if ( w->tw && w->th && ( w->friction > 0 || w->bounce_loss > 0 ) )
 		GP_LAUNCH( n, tile_friction( w->pos, w->prev, w->rad, w->tiles, w->tw, w->th, n, w->friction, w->bounce_loss ) );
@@ -1969,7 +2001,7 @@ int gp_body_pairs( const GpWorld *w, int *a, int *b, int max )
 	for ( int i = 0; i < w->n; ++i )
 		for ( int j = i + 1; j < w->n; ++j )
 		{
-			if ( w->owner[i] == w->owner[j] || w->frozen[i] || w->frozen[j] )
+			if ( w->owner[i] < 0 || w->owner[j] < 0 || w->owner[i] == w->owner[j] || w->frozen[i] || w->frozen[j] )
 				continue;
 			float dx = w->pos[2 * i] - w->pos[2 * j], dy = w->pos[2 * i + 1] - w->pos[2 * j + 1];
 			float r = w->rad[i] + w->rad[j] + 0.03f;
@@ -1996,7 +2028,7 @@ int gp_tile_contacts( const GpWorld *w, int *body, int *tile, int max )
 	int n = 0;
 	for ( int i = 0; i < w->n && w->tw; ++i )
 	{
-		if ( w->frozen[i] )
+		if ( w->frozen[i] || w->owner[i] < 0 )
 			continue;
 		float x = w->pos[2 * i], y = w->pos[2 * i + 1], r = w->rad[i] + 0.03f;
 		for ( int ty = (int)floorf( y - r ); ty <= (int)floorf( y + r ); ++ty )
