@@ -706,8 +706,210 @@ def test_prowl_bodies(mods, rnd):
                 assert unpack_f(buf) == want, ("grouped", trial, color, grp)
 
 
+def _can_collide(ca, ma, ga, cb, mb, gb):
+    if ga != 0 and ga == gb:
+        return ga > 0
+    return (ma & cb) != 0 and (mb & ca) != 0
+
+
+def filtered_model(pos, prv, rad, inv, flt, mat, ids, objs, cells, total, color, thr):
+    """solve_collisions_filtered in doubles (tolerance compare), cell after cell."""
+    pos, prv = list(pos), list(prv)
+    for start in cells:
+        h = ids[start]
+        if 1 + unsplit(h) % 2 + (unsplit(h >> 1) % 2) * 2 != color:
+            continue
+        i = start
+        while i < total and ids[i] == h:
+            a = objs[i]
+            j = i + 1
+            while j < total and ids[j] == h:
+                b = objs[j]
+                j += 1
+                ga = flt[4 * a + 2] - (1 << 32) if flt[4 * a + 2] >= 1 << 31 else flt[4 * a + 2]
+                gb = flt[4 * b + 2] - (1 << 32) if flt[4 * b + 2] >= 1 << 31 else flt[4 * b + 2]
+                if flt[4 * a + 3] != 0 and flt[4 * a + 3] == flt[4 * b + 3]:
+                    continue
+                if not _can_collide(flt[4 * a], flt[4 * a + 1], ga, flt[4 * b], flt[4 * b + 1], gb):
+                    continue
+                w = inv[a] + inv[b]
+                if w <= 0:
+                    continue
+                vx, vy = pos[2 * a] - pos[2 * b], pos[2 * a + 1] - pos[2 * b + 1]
+                d = math.hypot(vx, vy)
+                rs = rad[a] + rad[b]
+                if not (rs * rs > d * d and d > 1e-4):
+                    continue
+                nx, ny = vx / d, vy / d
+                corr = (rs - d) * 0.6
+                sa, sb = inv[a] / w, inv[b] / w
+                rvx = (pos[2 * a] - prv[2 * a]) - (pos[2 * b] - prv[2 * b])
+                rvy = (pos[2 * a + 1] - prv[2 * a + 1]) - (pos[2 * b + 1] - prv[2 * b + 1])
+                vn = rvx * nx + rvy * ny
+                vt = rvx * -ny + rvy * nx
+                pos[2 * a] += nx * corr * sa
+                pos[2 * a + 1] += ny * corr * sa
+                pos[2 * b] -= nx * corr * sb
+                pos[2 * b + 1] -= ny * corr * sb
+                mu = math.sqrt(mat[4 * a] * mat[4 * b])
+                e = max(mat[4 * a + 1], mat[4 * b + 1])
+                want, load = vn, corr
+                if vn <= 0:
+                    want = e * -vn if -vn > thr else 0.0
+                    load = corr - vn
+                dvn = want - (vn + corr)
+                lim = mu * load
+                dvt = min(max(-vt, -lim), lim)
+                cx, cy = dvn * nx + dvt * -ny, dvn * ny + dvt * nx
+                prv[2 * a] -= cx * sa
+                prv[2 * a + 1] -= cy * sa
+                prv[2 * b] += cx * sb
+                prv[2 * b + 1] += cy * sb
+            i += 1
+    return pos, prv
+
+
+def _filtered_run(m, pos, prv, rad, inv, flt, mat, thr=0.01):
+    """All circles in one collision cell (colour 1); returns (positions, previous)."""
+    n = len(rad)
+    bp, bq = pack_f(pos), pack_f(prv)
+    m.run("solve_collisions_filtered", groups(1),
+          {0: pack_u([0, 0, 1]), 1: pack_u([0]), 2: pack_u([0] * n), 3: pack_u(list(range(n))), 4: bp,
+           5: pack_f(rad), 6: pack_u([3, n]), 7: pack_u(flt), 8: pack_f(mat), 9: pack_f(inv), 10: bq},
+          pack_u([1]) + pack_f([thr]))
+    return unpack_f(bp), unpack_f(bq)
+
+
+def test_prowl_material(mods, rnd):
+    m = mods["prowl_material"]
+    # --- integrate_material: gravity scale and damping per circle, zero inverse mass stays put
+    n = 40
+    pos = [f32(rnd.uniform(1, 9)) for _ in range(2 * n)]
+    prv = [f32(pos[k] + rnd.uniform(-0.1, 0.1)) for k in range(2 * n)]
+    rad = [f32(0.3)] * n
+    mat = []
+    for k in range(n):
+        mat += [0.4, 0.0, rnd.choice([0.0, 0.5, 1.0, -1.0]), rnd.choice([1.0, 0.9])]
+    inv = [0.0 if k % 5 == 0 else 1.0 / 0.3 for k in range(n)]
+    dt, gx, gy, damp = 1 / 60, 0.0, -18.0, 0.999
+    want_p, want_q = list(pos), list(prv)
+    for i in range(n):
+        if inv[i] == 0.0:
+            want_q[2 * i], want_q[2 * i + 1] = pos[2 * i], pos[2 * i + 1]
+            continue
+        for ax_, g in ((0, gx), (1, gy)):
+            c, q = pos[2 * i + ax_], prv[2 * i + ax_]
+            nxt = c + (c - q) * damp * mat[4 * i + 3] + g * mat[4 * i + 2] * dt * dt
+            want_p[2 * i + ax_] = min(max(nxt, 0.3), (10.0 if ax_ == 0 else 8.0) - 0.3)
+            want_q[2 * i + ax_] = c
+    bp, bq = pack_f(pos), pack_f(prv)
+    m.run("integrate_material", groups(n), {0: bp, 1: bq, 2: pack_f(rad), 11: pack_f(mat), 13: pack_f(inv)},
+          pack_f([dt, gx, gy, damp, 10.0, 8.0]) + pack_u([n]))
+    _close(unpack_f(bp), want_p, 1e-5, "integrate_material positions")
+    _close(unpack_f(bq), want_q, 1e-6, "integrate_material previous")
+
+    # --- solve_collisions_filtered against its model: random circles, filters, masses, materials
+    touched = 0
+    for trial in range(10):
+        n = rnd.choice([6, 14, 30])
+        pos = [f32(rnd.uniform(0, 6)) for _ in range(2 * n)]
+        prv = [f32(pos[k] + rnd.uniform(-0.15, 0.15)) for k in range(2 * n)]
+        rad = [f32(rnd.uniform(0.2, 0.9)) for _ in range(n)]
+        inv = [0.0 if rnd.random() < 0.1 else f32(rnd.uniform(0.5, 4.0)) for _ in range(n)]
+        flt, mat = [], []
+        for k in range(n):
+            flt += [1 << rnd.randrange(3), rnd.choice([M32, 0b011, 0b101, 0]), rnd.choice([0, 0, 0, 3, -3]) & M32, rnd.choice([0, 0, 0, 7])]
+            mat += [rnd.choice([0.0, 0.4, 1.0]), rnd.choice([0.0, 0.5, 1.0]), 1.0, 1.0]
+        pairs = sorted((morton(int(pos[2*k] // 2), int(pos[2*k+1] // 2)), k) for k in range(n))
+        ids = [p[0] for p in pairs]
+        objs = [p[1] for p in pairs]
+        total = len(pairs)
+        cells = [i for i in range(total)
+                 if (i == 0 or ids[i - 1] != ids[i]) and i + 1 < total and ids[i + 1] == ids[i]]
+        if not cells:
+            continue
+        for color in (1, 2, 3, 4):
+            wp, wq = filtered_model(pos, prv, rad, inv, flt, mat, ids, objs, cells, total, color, 0.01)
+            bp, bq = pack_f(pos), pack_f(prv)
+            m.run("solve_collisions_filtered", groups(len(cells)),
+                  {0: pack_u([0, 0, len(cells)]), 1: pack_u(cells), 2: pack_u(ids), 3: pack_u(objs), 4: bp,
+                   5: pack_f(rad), 6: pack_u([3, total]), 7: pack_u(flt), 8: pack_f(mat), 9: pack_f(inv), 10: bq},
+                  pack_u([color]) + pack_f([0.01]))
+            _close(unpack_f(bp), wp, 1e-3, "filtered positions")
+            _close(unpack_f(bq), wq, 1e-3, "filtered previous")
+            touched += sum(1 for k in range(len(wp)) if abs(wp[k] - pos[k]) > 1e-9)
+    assert touched, "no collision was ever resolved"
+
+    # --- known answers: two equal circles, a runs into a resting b (overlap 0.1, approach 0.2 per step)
+    ones = [1.0, 1.0]
+    all_f = [1, M32, 0, 0, 1, M32, 0, 0]
+    def pair(e, vy=0.0, mu=0.4, flt=all_f, inv=ones):
+        mat = [mu, e, 1.0, 1.0, mu, e, 1.0, 1.0]
+        p, q = _filtered_run(m, [1.0, 1.0, 1.9, 1.0], [0.8, 1.0 - vy, 1.9, 1.0], [0.5, 0.5], inv, flt, mat)
+        return p, q, (p[0] - q[0], p[1] - q[1]), (p[2] - q[2], p[3] - q[3])
+    _, _, va, vb = pair(1.0, mu=0.0)
+    assert abs(va[0]) < 1e-5 and abs(vb[0] - 0.2) < 1e-5, ("bounciness 1 swaps the velocities", va, vb)
+    _, _, va, vb = pair(0.0, mu=0.0)
+    assert abs(va[0] - 0.1) < 1e-5 and abs(vb[0] - 0.1) < 1e-5, ("bounciness 0 leaves them moving together", va, vb)
+    _, _, va, vb = pair(0.0, vy=0.3, mu=0.0)
+    assert abs(va[1] - 0.3) < 1e-5, ("no friction keeps the sliding speed", va)
+    _, _, va, vb = pair(0.0, vy=0.3, mu=0.4)
+    assert abs(va[1] - 0.248) < 1e-4 and abs(vb[1] - 0.052) < 1e-4, ("friction takes mu * load, shared", va, vb)
+    # filters: a mask without the other's category, or a negative shared group, lets them pass through
+    for fl, name in (([1, 0b10, 0, 0, 1, M32, 0, 0], "mask"), ([1, M32, -2 & M32, 0, 1, M32, -2 & M32, 0], "group")):
+        p, q, _, _ = pair(0.0, flt=fl)
+        assert p == [1.0, 1.0, f32(1.9), 1.0] and q == [f32(0.8), 1.0, f32(1.9), 1.0], ("filtered pair untouched", name, p, q)
+    p, q, _, _ = pair(0.0, flt=[1, 0, 5, 0, 1, 0, 5, 0])
+    assert p != [1.0, 1.0, f32(1.9), 1.0], "a shared positive group collides even with empty masks"
+    p, q, _, _ = pair(0.0, flt=[1, M32, 5, 9, 1, M32, 5, 9])
+    assert p == [1.0, 1.0, f32(1.9), 1.0], "circles of one body never collide, whatever their group"
+    # mass: a heavy circle (inverse mass 0.1) barely moves, an immovable one (0) does not
+    p, q, _, _ = pair(0.0, inv=[1.0, 0.1])
+    assert abs(p[2] - f32(1.9)) < abs(p[0] - 1.0) / 5, ("the heavy one is pushed less", p)
+    p, q, _, _ = pair(0.0, inv=[1.0, 0.0])
+    assert p[2] == f32(1.9) and q[2] == f32(1.9), ("an immovable circle is not moved", p, q)
+
+    # --- tile_material on a floor
+    tw, th = 6, 3
+    tiles = [1] * tw + [0] * (tw * (th - 1))
+    for circ_mu, circ_e, tile_mu, tile_e, want_slide, want_leave in (
+            (0.5, 0.0, 0.5, 0.0, 0.5, 1.0), (0.0, 0.0, 0.5, 0.0, 0.0, 1.0), (0.5, 0.75, 0.5, 0.0, 0.5, 0.25),
+            (0.5, 0.0, 0.5, 1.0, 0.5, 0.0)):
+        pos = [2.0, 1.25, 4.0, 1.25]
+        prv = [1.9, 1.26, 4.0, 1.15]                    # 0 slides on the floor, 1 is leaving it
+        bq = pack_f(prv)
+        m.run("tile_material", groups(2), {0: pack_f(pos), 1: bq, 2: pack_f([0.25] * 2), 5: pack_u(tiles),
+                                           11: pack_f([circ_mu, circ_e, 1.0, 1.0] * 2), 13: pack_f([1.0, 1.0]), 14: pack_f([0.0, 0.0])},
+              pack_u([tw, th, 2]) + pack_f([tile_mu, tile_e, 0.05]))
+        got = unpack_f(bq)
+        assert abs((pos[0] - got[0]) - 0.1 * (1.0 - math.sqrt(circ_mu * tile_mu))) < 1e-4, ("friction", circ_mu, tile_mu, got)
+        assert abs((pos[3] - got[3]) - 0.1 * (1.0 - want_leave)) < 1e-4, ("leaving speed kept", circ_e, tile_e, got)
+    # a circle driven into the floor bounces off at e times its speed; a slow one just stops
+    for vy, e, want in ((0.4, 0.5, 0.2), (0.4, 0.0, 0.0), (0.4, 1.0, 0.4), (0.01, 1.0, 0.0)):
+        bq = pack_f([2.0, 1.25 + vy])
+        m.run("tile_material", groups(1), {0: pack_f([2.0, 1.25]), 1: bq, 2: pack_f([0.25]), 5: pack_u(tiles),
+                                           11: pack_f([0.0, e, 1.0, 1.0]), 13: pack_f([1.0]), 14: pack_f([0.0])},
+              pack_u([tw, th, 1]) + pack_f([0.5, 0.0, 0.05]))
+        assert abs((1.25 - unpack_f(bq)[1]) - want) < 1e-5, ("bounce off the floor", vy, e, unpack_f(bq))
+    # friction acts on the slip: a circle rolling without slipping (spin = speed / radius) keeps its speed
+    # (rolling to the right on the floor: v.t = -vx for t = (-1, 0), so omega = -vx / r = -0.1 / 0.25 per step)
+    for om, want_slow in ((-0.4, 0.0), (0.0, 0.05)):
+        bq = pack_f([2.0 - 0.1, 1.25])
+        m.run("tile_material", groups(1), {0: pack_f([2.0, 1.25]), 1: bq, 2: pack_f([0.25]), 5: pack_u(tiles),
+                                           11: pack_f([1.0, 0.0, 1.0, 1.0]), 13: pack_f([1.0]), 14: pack_f([om])},
+              pack_u([tw, th, 1]) + pack_f([0.25, 0.0, 0.05]))
+        lost = (2.0 - unpack_f(bq)[0]) - 0.1
+        assert abs(-lost - want_slow) < 1e-4, ("rolling is not slowed, sliding is", om, lost)
+    # an immovable circle is not touched
+    bq = pack_f([1.9, 1.26])
+    m.run("tile_material", groups(1), {0: pack_f([2.0, 1.25]), 1: bq, 2: pack_f([0.25]), 5: pack_u(tiles),
+                                       11: pack_f([0.5, 0.0, 1.0, 1.0]), 13: pack_f([0.0]), 14: pack_f([0.0])},
+          pack_u([tw, th, 1]) + pack_f([0.5, 0.0, 0.05]))
+    assert unpack_f(bq) == [f32(1.9), f32(1.26)], "an immovable circle keeps its previous position"
+
+
 TESTS = [test_home_cell_ids, test_rearrange, test_verlet, test_grid,
-         test_collision_cells, test_collision_solver, test_prefix_sum, test_radix_sort, test_prowl_world, test_prowl_bodies]
+         test_collision_cells, test_collision_solver, test_prefix_sum, test_radix_sort, test_prowl_world, test_prowl_bodies, test_prowl_material]
 
 
 class _Module:
@@ -736,7 +938,7 @@ def run(spv_dir, crust_dir, only=None, out=sys.stdout):
     from shivyc.spirv import bytes_to_words
     from shivyc import spirv_reader
     needed = {"home_cell_ids", "rearrange", "particle_integration", "grid",
-              "collision_cell_builder", "collision_solver", "prefix_sum", "radix_sort", "prowl_world", "prowl_bodies"}
+              "collision_cell_builder", "collision_solver", "prefix_sum", "radix_sort", "prowl_world", "prowl_bodies", "prowl_material"}
     mods = {}
     for name in sorted(needed):
         path = os.path.join(spv_dir, name + ".spv")
@@ -756,7 +958,8 @@ def run(spv_dir, crust_dir, only=None, out=sys.stdout):
                   "collision_solver": "collision_solver",
                   "prefix_sum": "prefix_sum",
                   "radix_sort": "radix_sort",
-                  "prowl_world": "prowl_world", "prowl_bodies": "prowl_bodies"}[short]
+                  "prowl_world": "prowl_world", "prowl_bodies": "prowl_bodies",
+                  "prowl_material": "prowl_material"}[short]
         if kernel not in mods:
             out.write("  skip  %-18s (%s.spv was not built)\n" % (short, kernel))
             continue
