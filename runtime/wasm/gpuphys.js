@@ -97,6 +97,14 @@ class World {
     this.gp.free(p);
     return id;
   }
+  /** A static quadratic Bezier collider p0 -> p1 (control) -> p2. side 0: a thin wall; +1 / -1: one edge of a solid contour
+   *  whose inside is on the left / right of the direction p0 -> p2. friction is Unity's, bounciness 0..1.
+   *  Returns the curve's index (-1 if the build lacks the curve kernels). */
+  addCurve(x0, y0, x1, y1, x2, y2, friction = 0.4, bounciness = 0, side = 0) {
+    return this.x.gp_add_curve(this.ptr, x0, y0, x1, y1, x2, y2, friction, bounciness, side);
+  }
+  clearCurves() { this.x.gp_clear_curves(this.ptr); }
+  get curveCount() { return this.x.gp_curve_count(this.ptr); }
   /** A free circle (no body), tag sand: returns its circle index. */
   addSand(x, y, radius = 0.08, vx = 0, vy = 0, dt = 1 / 60) { return this.x.gp_add_sand(this.ptr, x, y, radius, vx, vy, dt); }
   /** Pours `count` grains in a disc of radius `brush` around (x, y); returns how many fitted. */
