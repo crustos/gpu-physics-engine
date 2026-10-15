@@ -103,37 +103,56 @@ fn tile_collide(
                 } else {
                     // The centre is inside the tile: leave through the nearest
                     // face that does not lead into another solid tile.
-                    let left: f32 = x - min_x;
-                    let right: f32 = min_x + 1.0 - x;
-                    let down: f32 = y - min_y;
-                    let up: f32 = min_y + 1.0 - y;
-                    let mut best: f32 = 1.0e9;
-                    let mut mx: f32 = 0.0;
-                    let mut my: f32 = 0.0;
+                    // distance to each face; a face that leads into another solid tile is made unreachable
+                    // (plain nested ifs: a `||` around a load makes some drivers' shader compilers take
+                    // forever, SwiftShader's among them)
+                    let mut left: f32 = x - min_x;
+                    let mut right: f32 = min_x + 1.0 - x;
+                    let mut down: f32 = y - min_y;
+                    let mut up: f32 = min_y + 1.0 - y;
                     let il: i32 = tile_index(w, h, tx - 1, ty);
                     let ir: i32 = tile_index(w, h, tx + 1, ty);
                     let id: i32 = tile_index(w, h, tx, ty - 1);
                     let iu: i32 = tile_index(w, h, tx, ty + 1);
-                    let open_l: bool = il < 0 || tiles[il as usize] == 0;
-                    let open_r: bool = ir < 0 || tiles[ir as usize] == 0;
-                    let open_d: bool = id < 0 || tiles[id as usize] == 0;
-                    let open_u: bool = iu < 0 || tiles[iu as usize] == 0;
-                    if open_l && left < best {
+                    if il >= 0 {
+                        if tiles[il as usize] != 0 {
+                            left = 1.0e9;
+                        }
+                    }
+                    if ir >= 0 {
+                        if tiles[ir as usize] != 0 {
+                            right = 1.0e9;
+                        }
+                    }
+                    if id >= 0 {
+                        if tiles[id as usize] != 0 {
+                            down = 1.0e9;
+                        }
+                    }
+                    if iu >= 0 {
+                        if tiles[iu as usize] != 0 {
+                            up = 1.0e9;
+                        }
+                    }
+                    let mut mx: f32 = 0.0;
+                    let mut my: f32 = 0.0;
+                    let mut best: f32 = 1.0e9;
+                    if left < best {
                         best = left;
                         mx = -(left + r);
                         my = 0.0;
                     }
-                    if open_r && right < best {
+                    if right < best {
                         best = right;
                         mx = right + r;
                         my = 0.0;
                     }
-                    if open_d && down < best {
+                    if down < best {
                         best = down;
                         mx = 0.0;
                         my = -(down + r);
                     }
-                    if open_u && up < best {
+                    if up < best {
                         best = up;
                         mx = 0.0;
                         my = up + r;

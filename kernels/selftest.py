@@ -712,6 +712,11 @@ def _can_collide(ca, ma, ga, cb, mb, gb):
     return (ma & cb) != 0 and (mb & ca) != 0
 
 
+def merge5(mat, inv):
+    """prowl_material's per-circle array: [friction, bounciness, gravity_scale, damping, inv_mass]."""
+    return [v for i in range(len(inv)) for v in (mat[4 * i:4 * i + 4] + [inv[i]])]
+
+
 def filtered_model(pos, prv, rad, inv, flt, mat, ids, objs, cells, total, color, thr):
     """solve_collisions_filtered in doubles (tolerance compare), cell after cell."""
     pos, prv = list(pos), list(prv)
@@ -775,7 +780,7 @@ def _filtered_run(m, pos, prv, rad, inv, flt, mat, thr=0.01):
     bp, bq = pack_f(pos), pack_f(prv)
     m.run("solve_collisions_filtered", groups(1),
           {0: pack_u([0, 0, 1]), 1: pack_u([0]), 2: pack_u([0] * n), 3: pack_u(list(range(n))), 4: bp,
-           5: pack_f(rad), 6: pack_u([3, n]), 7: pack_u(flt), 8: pack_f(mat), 9: pack_f(inv), 10: bq},
+           5: pack_f(rad), 6: pack_u([3, n]), 7: pack_u(flt), 8: pack_f(merge5(mat, inv)), 10: bq},
           pack_u([1]) + pack_f([thr]))
     return unpack_f(bp), unpack_f(bq)
 
@@ -803,7 +808,7 @@ def test_prowl_material(mods, rnd):
             want_p[2 * i + ax_] = min(max(nxt, 0.3), (10.0 if ax_ == 0 else 8.0) - 0.3)
             want_q[2 * i + ax_] = c
     bp, bq = pack_f(pos), pack_f(prv)
-    m.run("integrate_material", groups(n), {0: bp, 1: bq, 2: pack_f(rad), 11: pack_f(mat), 13: pack_f(inv)},
+    m.run("integrate_material", groups(n), {0: bp, 1: bq, 2: pack_f(rad), 11: pack_f(merge5(mat, inv))},
           pack_f([dt, gx, gy, damp, 10.0, 8.0]) + pack_u([n]))
     _close(unpack_f(bp), want_p, 1e-5, "integrate_material positions")
     _close(unpack_f(bq), want_q, 1e-6, "integrate_material previous")
@@ -833,7 +838,7 @@ def test_prowl_material(mods, rnd):
             bp, bq = pack_f(pos), pack_f(prv)
             m.run("solve_collisions_filtered", groups(len(cells)),
                   {0: pack_u([0, 0, len(cells)]), 1: pack_u(cells), 2: pack_u(ids), 3: pack_u(objs), 4: bp,
-                   5: pack_f(rad), 6: pack_u([3, total]), 7: pack_u(flt), 8: pack_f(mat), 9: pack_f(inv), 10: bq},
+                   5: pack_f(rad), 6: pack_u([3, total]), 7: pack_u(flt), 8: pack_f(merge5(mat, inv)), 10: bq},
                   pack_u([color]) + pack_f([0.01]))
             _close(unpack_f(bp), wp, 1e-3, "filtered positions")
             _close(unpack_f(bq), wq, 1e-3, "filtered previous")
@@ -879,7 +884,7 @@ def test_prowl_material(mods, rnd):
         prv = [1.9, 1.26, 4.0, 1.15]                    # 0 slides on the floor, 1 is leaving it
         bq = pack_f(prv)
         m.run("tile_material", groups(2), {0: pack_f(pos), 1: bq, 2: pack_f([0.25] * 2), 5: pack_u(tiles),
-                                           11: pack_f([circ_mu, circ_e, 1.0, 1.0] * 2), 13: pack_f([1.0, 1.0]), 14: pack_f([0.0, 0.0])},
+                                           11: pack_f(merge5([circ_mu, circ_e, 1.0, 1.0] * 2, [1.0, 1.0])), 14: pack_f([0.0, 0.0])},
               pack_u([tw, th, 2]) + pack_f([tile_mu, tile_e, 0.05]))
         got = unpack_f(bq)
         assert abs((pos[0] - got[0]) - 0.1 * (1.0 - math.sqrt(circ_mu * tile_mu))) < 1e-4, ("friction", circ_mu, tile_mu, got)
@@ -888,7 +893,7 @@ def test_prowl_material(mods, rnd):
     for vy, e, want in ((0.4, 0.5, 0.2), (0.4, 0.0, 0.0), (0.4, 1.0, 0.4), (0.01, 1.0, 0.0)):
         bq = pack_f([2.0, 1.25 + vy])
         m.run("tile_material", groups(1), {0: pack_f([2.0, 1.25]), 1: bq, 2: pack_f([0.25]), 5: pack_u(tiles),
-                                           11: pack_f([0.0, e, 1.0, 1.0]), 13: pack_f([1.0]), 14: pack_f([0.0])},
+                                           11: pack_f(merge5([0.0, e, 1.0, 1.0], [1.0])), 14: pack_f([0.0])},
               pack_u([tw, th, 1]) + pack_f([0.5, 0.0, 0.05]))
         assert abs((1.25 - unpack_f(bq)[1]) - want) < 1e-5, ("bounce off the floor", vy, e, unpack_f(bq))
     # friction acts on the slip: a circle rolling without slipping (spin = speed / radius) keeps its speed
@@ -896,14 +901,14 @@ def test_prowl_material(mods, rnd):
     for om, want_slow in ((-0.4, 0.0), (0.0, 0.05)):
         bq = pack_f([2.0 - 0.1, 1.25])
         m.run("tile_material", groups(1), {0: pack_f([2.0, 1.25]), 1: bq, 2: pack_f([0.25]), 5: pack_u(tiles),
-                                           11: pack_f([1.0, 0.0, 1.0, 1.0]), 13: pack_f([1.0]), 14: pack_f([om])},
+                                           11: pack_f(merge5([1.0, 0.0, 1.0, 1.0], [1.0])), 14: pack_f([om])},
               pack_u([tw, th, 1]) + pack_f([0.25, 0.0, 0.05]))
         lost = (2.0 - unpack_f(bq)[0]) - 0.1
         assert abs(-lost - want_slow) < 1e-4, ("rolling is not slowed, sliding is", om, lost)
     # an immovable circle is not touched
     bq = pack_f([1.9, 1.26])
     m.run("tile_material", groups(1), {0: pack_f([2.0, 1.25]), 1: bq, 2: pack_f([0.25]), 5: pack_u(tiles),
-                                       11: pack_f([0.5, 0.0, 1.0, 1.0]), 13: pack_f([0.0]), 14: pack_f([0.0])},
+                                       11: pack_f(merge5([0.5, 0.0, 1.0, 1.0], [0.0])), 14: pack_f([0.0])},
           pack_u([tw, th, 1]) + pack_f([0.5, 0.0, 0.05]))
     assert unpack_f(bq) == [f32(1.9), f32(1.26)], "an immovable circle keeps its previous position"
 

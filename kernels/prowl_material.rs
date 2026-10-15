@@ -8,7 +8,7 @@
 //   tile_material              tile_friction with the circle's own friction and bounciness
 //
 // Per-circle arrays (all indexed by circle):
-//   material  f32, stride 4: [friction, bounciness, gravity_scale, damping]
+//   material  f32, stride 5: [friction, bounciness, gravity_scale, damping, inv_mass]
 //             friction >= 0 (Coulomb, 0.4 is Unity's default), bounciness 0..1,
 //             gravity_scale multiplies gravity (0 floats, -1 rises), damping is a per-step
 //             multiplier on the Verlet velocity (1 = none), on top of the world's damping.
@@ -18,7 +18,8 @@
 //             mask has the other's category bit. `body` is the engine's own rule, kept apart from
 //             the user's filter: circles with the same non-zero body (the circles of one crate)
 //             never collide with each other.
-//   inv_mass  f32: 1 / mass, 0 for an immovable circle (the plain engine uses 1 / radius).
+//   inv_mass (material[4]) is 1 / mass, 0 for an immovable circle (the plain engine uses 1 / radius).
+//             It lives in `material` to keep each kernel within WebGPU's 10 storage buffers.
 //
 // A circle's velocity is `positions - previous_positions` (Verlet), so a collision changes a
 // velocity by moving `previous_positions`. Combining two circles' materials follows Box2D:
@@ -33,7 +34,6 @@ fn integrate_material(
     #[binding(1)] previous_positions: &mut [f32],
     #[binding(2)] radius: &[f32],
     #[binding(11)] material: &[f32],
-    #[binding(13)] inv_mass: &[f32],
     delta_time: f32,
     gravity_x: f32,
     gravity_y: f32,
@@ -49,13 +49,13 @@ fn integrate_material(
     let i: usize = (index * 2) as usize;
     let cx: f32 = positions[i];
     let cy: f32 = positions[i + 1];
-    if inv_mass[index as usize] <= 0.0 {
+    let m: usize = (index * 5) as usize;
+    if material[m + 4] <= 0.0 {
         // static or kinematic: it stays where the host put it, with no velocity of its own
         previous_positions[i] = cx;
         previous_positions[i + 1] = cy;
         return;
     }
-    let m: usize = (index * 4) as usize;
     let gscale: f32 = material[m + 2];
     let damp: f32 = damping * material[m + 3];
     let vx: f32 = (cx - previous_positions[i]) * damp;
@@ -110,7 +110,6 @@ fn solve_collisions_filtered(
     #[binding(6)] uniform_data: &[u32],
     #[binding(7)] filter: &[u32],
     #[binding(8)] material: &[f32],
-    #[binding(9)] inv_mass: &[f32],
     #[binding(10)] previous_positions: &mut [f32],
     current_cell_color: u32,
     bounce_threshold: f32,
@@ -142,6 +141,8 @@ fn solve_collisions_filtered(
             let b: usize = object_ids[j as usize] as usize;
             let fa: usize = a * 4;
             let fb: usize = b * 4;
+            let ma: usize = a * 5;
+            let mb: usize = b * 5;
             let same_body: bool = filter[fa + 3] != 0 && filter[fa + 3] == filter[fb + 3];
             let ok: bool = !same_body && can_collide(
                 filter[fa],
@@ -151,8 +152,8 @@ fn solve_collisions_filtered(
                 filter[fb + 1],
                 filter[fb + 2] as i32,
             );
-            let inv_a: f32 = inv_mass[a];
-            let inv_b: f32 = inv_mass[b];
+            let inv_a: f32 = material[ma + 4];
+            let inv_b: f32 = material[mb + 4];
             let wsum: f32 = inv_a + inv_b;
             if ok && wsum > 0.0 {
                 let ax: f32 = positions[a * 2];
@@ -188,10 +189,10 @@ fn solve_collisions_filtered(
                     positions[b * 2 + 1] = by - ny * corr * share_b;
 
                     // Box2D's combination: friction is the geometric mean, bounciness the larger
-                    let mu: f32 = (material[fa] * material[fb]).sqrt();
-                    let mut e: f32 = material[fa + 1];
-                    if material[fb + 1] > e {
-                        e = material[fb + 1];
+                    let mu: f32 = (material[ma] * material[mb]).sqrt();
+                    let mut e: f32 = material[ma + 1];
+                    if material[mb + 1] > e {
+                        e = material[mb + 1];
                     }
 
                     // normal: the push-out already separates them at `corr` per step; the
@@ -249,7 +250,6 @@ fn tile_material(
     #[binding(2)] radius: &[f32],
     #[binding(5)] tiles: &[u32],
     #[binding(11)] material: &[f32],
-    #[binding(13)] inv_mass: &[f32],
     #[binding(14)] omega: &[f32],
     tiles_w: u32,
     tiles_h: u32,
@@ -262,11 +262,11 @@ fn tile_material(
     if index >= num_particles {
         return;
     }
-    if inv_mass[index as usize] <= 0.0 {
+    let m: usize = (index * 5) as usize;
+    if material[m + 4] <= 0.0 {
         return;
     }
     let i: usize = (index * 2) as usize;
-    let m: usize = (index * 4) as usize;
     let w: i32 = tiles_w as i32;
     let h: i32 = tiles_h as i32;
     let r: f32 = radius[index as usize] + 0.02;
