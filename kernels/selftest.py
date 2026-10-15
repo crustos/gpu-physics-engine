@@ -913,8 +913,115 @@ def test_prowl_material(mods, rnd):
     assert unpack_f(bq) == [f32(1.9), f32(1.26)], "an immovable circle keeps its previous position"
 
 
+def _bez_pt(c, t):
+    u = 1 - t
+    return (u * u * c[0] + 2 * u * t * c[2] + t * t * c[4], u * u * c[1] + 2 * u * t * c[3] + t * t * c[5])
+
+
+def _nearest_dense(c, x, y, n=4000):
+    best = (1e30, 0.0)
+    for i in range(n + 1):
+        qx, qy = _bez_pt(c, i / n)
+        d = math.hypot(x - qx, y - qy)
+        if d < best[0]:
+            best = (d, i / n)
+    return best
+
+
+def curve_rec(c, friction=0.2, bounce=0.0, side=0):
+    xs, ys = c[0::2], c[1::2]
+    return list(c) + [min(xs), min(ys), max(xs), max(ys), friction, bounce, float(side), 0.0, 0.0, 0.0]
+
+
+def test_prowl_curves(mods, rnd):
+    m = mods["prowl_curves"]
+
+    def collide(curves, circles, r=0.25, inv=1.0):
+        """circles: [(x, y, px, py)] -> new positions."""
+        n = len(circles)
+        pos = pack_f([v for c in circles for v in c[:2]])
+        prv = pack_f([v for c in circles for v in c[2:]])
+        flat = [v for c in curves for v in c]
+        m.run("curve_collide", groups(n), {0: pos, 1: prv, 2: pack_f([r] * n), 11: pack_f(merge5([0.4, 0, 1, 1] * n, [inv] * n)),
+                                           15: pack_f(flat)}, pack_u([n, len(curves)]))
+        u = unpack_f(pos)
+        return [(u[2 * i], u[2 * i + 1]) for i in range(n)]
+
+    # a thin bowl: from (1,3) down through (3,1) to (5,3): the lowest point is (3, 2)
+    bowl = [1.0, 3.0, 3.0, 1.0, 5.0, 3.0]
+    wall = curve_rec(bowl)
+    # a circle on top of it is lifted to r above the curve, one under it is pushed down to r below
+    (a,) = collide([wall], [(3.0, 2.1, 3.0, 2.5)])
+    assert abs(a[0] - 3.0) < 1e-4 and abs(a[1] - 2.25) < 2e-3, ("lifted onto the bowl", a)
+    (a,) = collide([wall], [(3.0, 1.9, 3.0, 1.2)])
+    assert abs(a[0] - 3.0) < 1e-4 and abs(a[1] - 1.75) < 2e-3, ("pushed down below the thin wall", a)
+    # a circle that is far enough stays; many random circles end exactly r from the curve, on their side
+    pts = []
+    for _ in range(60):
+        x, y = rnd.uniform(0.5, 5.5), rnd.uniform(1.2, 3.4)
+        pts.append((f32(x), f32(y)))
+    got = collide([wall], [(x, y, x, y + 0.3) for x, y in pts])
+    for (x, y), (gx, gy) in zip(pts, got):
+        d0, _ = _nearest_dense(bowl, x, y)
+        d1, _ = _nearest_dense(bowl, gx, gy)
+        if d0 >= 0.25 - 1e-4:
+            assert (gx, gy) == (x, y) or math.hypot(gx - x, gy - y) < 1e-6, ("far circles stay", (x, y), (gx, gy))
+        else:
+            assert abs(d1 - 0.25) < 3e-3, ("pushed out to r", (x, y), (gx, gy), d1)
+    # the end of a thin wall: a circle past the tip is pushed away from the tip, not snapped to a face
+    tip = bowl[:2]
+    (a,) = collide([wall], [(0.95, 3.1, 1.5, 3.3)])
+    assert abs(math.hypot(a[0] - tip[0], a[1] - tip[1]) - 0.25) < 1e-3, ("radial push at the free end", a)
+    # an immovable circle is left alone
+    (a,) = collide([wall], [(3.0, 2.1, 3.0, 2.5)], inv=0.0)
+    assert a == (f32(3.0), f32(2.1)), ("static circle", a)
+
+    # a solid hill: from (1,1) over (3,5) to (5,1), the inside is below (right of the direction): side = -1
+    hill = [1.0, 1.0, 3.0, 5.0, 5.0, 1.0]
+    solid = curve_rec(hill, side=-1)
+    for x, y in ((3.0, 3.1), (3.0, 2.9), (3.0, 2.85)):
+        (a,) = collide([solid], [(x, y, x, y)])
+        d1, _ = _nearest_dense(hill, a[0], a[1])
+        assert abs(d1 - 0.25) < 3e-3 and a[1] > 3.0, ("pushed out of the hill, upwards", (x, y), a)
+    (a,) = collide([solid], [(3.0, 3.9, 3.0, 3.9)])
+    assert a == (f32(3.0), f32(3.9)), ("clear of the hill", a)
+    # the same shape with the inside above: a circle on the underside stays below, the cap is solid
+    cap = curve_rec(hill, side=1)
+    (a,) = collide([cap], [(3.0, 2.9, 3.0, 2.0)])
+    assert a[1] < 3.0 and abs(_nearest_dense(hill, a[0], a[1])[0] - 0.25) < 3e-3, ("below a hill that is solid above", a)
+
+    # --- curve_material: the same contact numbers as tile_material, on a flat curve
+    flat = [1.0, 1.0, 3.0, 1.0, 5.0, 1.0]
+
+    def material(mu_c, e_c, mu_w, e_w, pos, prv, om=0.0, side=0, thr=0.05):
+        n = len(pos) // 2
+        bq = pack_f(prv)
+        rec = curve_rec(flat, friction=mu_w, bounce=e_w, side=side)
+        m.run("curve_material", groups(n), {0: pack_f(pos), 1: bq, 2: pack_f([0.25] * n),
+                                            11: pack_f(merge5([mu_c, e_c, 1.0, 1.0] * n, [1.0] * n)), 14: pack_f([om] * n),
+                                            15: pack_f(rec)}, pack_u([n, 1]) + pack_f([thr]))
+        return unpack_f(bq)
+    for circ_mu, circ_e, w_mu, w_e, want_leave in ((0.5, 0.0, 0.5, 0.0, 1.0), (0.0, 0.0, 0.5, 0.0, 1.0),
+                                                   (0.5, 0.75, 0.5, 0.0, 0.25), (0.5, 0.0, 0.5, 1.0, 0.0)):
+        pos = [2.0, 1.25, 4.0, 1.25]
+        prv = [1.9, 1.26, 4.0, 1.15]
+        got = material(circ_mu, circ_e, w_mu, w_e, pos, prv)
+        assert abs((pos[0] - got[0]) - 0.1 * (1.0 - math.sqrt(circ_mu * w_mu))) < 1e-4, ("friction", got)
+        assert abs((pos[3] - got[3]) - 0.1 * (1.0 - want_leave)) < 1e-4, ("leaving speed kept", got)
+    for vy, e, want in ((0.4, 0.5, 0.2), (0.4, 0.0, 0.0), (0.4, 1.0, 0.4), (0.01, 1.0, 0.0)):
+        got = material(0.0, e, 0.5, 0.0, [2.0, 1.25], [2.0, 1.25 + vy])
+        assert abs((1.25 - got[1]) - want) < 1e-5, ("bounce", vy, e, got)
+    # a circle that is not touching, or under a solid contour, is untouched
+    got = material(0.5, 0.0, 0.5, 0.0, [2.0, 2.0], [1.9, 2.05])
+    assert got == [f32(1.9), f32(2.05)], ("no contact", got)
+    got = material(0.5, 0.0, 0.5, 0.0, [2.0, 1.25], [1.9, 1.3], side=1)       # inside is on the left = above: the circle is inside
+    assert got == [f32(1.9), f32(1.3)], ("inside a solid contour", got)
+    got = material(0.5, 0.0, 0.5, 0.0, [2.0, 0.75], [1.9, 0.7], side=1)        # below it: outside
+    assert got != [f32(1.9), f32(0.7)], ("outside a solid contour touches", got)
+
+
 TESTS = [test_home_cell_ids, test_rearrange, test_verlet, test_grid,
-         test_collision_cells, test_collision_solver, test_prefix_sum, test_radix_sort, test_prowl_world, test_prowl_bodies, test_prowl_material]
+         test_collision_cells, test_collision_solver, test_prefix_sum, test_radix_sort, test_prowl_world, test_prowl_bodies, test_prowl_material, test_prowl_curves]
 
 
 class _Module:
@@ -943,7 +1050,7 @@ def run(spv_dir, crust_dir, only=None, out=sys.stdout):
     from shivyc.spirv import bytes_to_words
     from shivyc import spirv_reader
     needed = {"home_cell_ids", "rearrange", "particle_integration", "grid",
-              "collision_cell_builder", "collision_solver", "prefix_sum", "radix_sort", "prowl_world", "prowl_bodies", "prowl_material"}
+              "collision_cell_builder", "collision_solver", "prefix_sum", "radix_sort", "prowl_world", "prowl_bodies", "prowl_material", "prowl_curves"}
     mods = {}
     for name in sorted(needed):
         path = os.path.join(spv_dir, name + ".spv")
@@ -964,7 +1071,7 @@ def run(spv_dir, crust_dir, only=None, out=sys.stdout):
                   "prefix_sum": "prefix_sum",
                   "radix_sort": "radix_sort",
                   "prowl_world": "prowl_world", "prowl_bodies": "prowl_bodies",
-                  "prowl_material": "prowl_material"}[short]
+                  "prowl_material": "prowl_material", "prowl_curves": "prowl_curves"}[short]
         if kernel not in mods:
             out.write("  skip  %-18s (%s.spv was not built)\n" % (short, kernel))
             continue
