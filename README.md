@@ -91,6 +91,7 @@ the only requirement.
 | `collision_cell_builder.rs`, `collision_solver.rs` | `count_objects_for_each_chunk`, `build_collision_cells_array`, `solve_collisions` | ports |
 | `prowl_world.rs` | `integrate_world`, `tile_collide` | added for [Prowl2D](https://github.com/crustos/Prowl2D): gravity and world box; circles against a grid of solid tiles |
 | `prowl_bodies.rs` | `solve_joints`, `solve_collisions_grouped`, `integrate_tagged`, `tile_friction`, `raycast`, `sensor_count` | added for Prowl2D: see below |
+| `prowl_material.rs` | `integrate_material`, `solve_collisions_filtered`, `tile_material` | Box2D-style per-circle settings: friction, bounciness, gravity scale, damping, inverse mass (0 = static/kinematic), and category/mask/group collision filtering; see below |
 
 ### Beyond particles: bodies, joints, queries
 
@@ -106,9 +107,52 @@ the only requirement.
 
 Prowl2D drives all of this from Python through wgpu-py: see its `GPU.md`.
 
+### Material, mass and filtering (Box2D's fixture settings)
+
+`prowl_material.rs` reads three per-circle arrays: `material` (friction, bounciness, gravity scale, damping), `filter` (category bits,
+mask bits, group index, as in Box2D) and `inv_mass` (0 makes a circle immovable). Pairs combine as in Box2D: friction is the geometric mean,
+bounciness the larger. A shared positive group always collides, a shared negative group never does; otherwise each mask must contain the
+other's category. Bounce and friction act on the Verlet velocity (`position - previous`), so they are approximate on stacks but exact for a
+single contact (`selftest.py` has the known answers: equal circles swap velocities at bounciness 1, stay together at 0). Bounce against a
+tile leaves at `bounciness` times the approach speed (slower than a threshold, 1 unit/s by default, just stops).
+
+In the C runtime: `gp_body_set_material(w, body, friction, bounciness, density, gravity_scale, drag)`, `gp_body_set_filter(w, body, category, mask, group)`
+and `gp_set_bounce_threshold`. The first call switches the step to these kernels (a world that never calls them steps exactly as before);
+`python3 runtime/check.py` builds the runtime with gcc and runs `runtime/test_gpuphys.c` (bounce heights, gravity scale, drag, filters). A host
+that links the translated kernel files itself must add `gpk_prowl_material.c` (`runtime/gpk.py` writes it); without it the calls return 0.
+The Prowl2D Python driver does not use them yet.
+
+### Contact events (C runtime)
+
+`gp_enable_events(w, 1)` makes every `gp_step` queue `GP_EVENT_BEGIN` / `END` (body against body, or against the tiles: `b = -1` and a tile index), with
+the contact point, the normal from `a` toward `b` and the closing speed, and `GP_EVENT_TRIGGER_ENTER` / `EXIT` for bodies made sensors with
+`gp_body_set_sensor` (a sensor collides with nothing; the category/mask filter says what it sees). `gp_poll_events` drains the queue. A contact
+begins within 0.01 tile units of touching and ends beyond 0.05, so a resting contact does not flicker. No kernel is involved: it is computed on the
+CPU from the step's collision cells. These are what a Unity-style `OnCollisionEnter2D` / `OnTriggerEnter2D` needs.
+
+### Joints between bodies (C runtime)
+
+`gp_add_body_joint` makes Box2D's **revolute** (angle limits, motor), **weld**, **prismatic** (translation limits, motor), **wheel** (a slider with a
+spring and damping, plus a spin motor), **distance** (rod, rope with `enable_limit`, or a spring with `frequency`) and **mouse** joints
+(`gp_joint_def` fills the defaults; `gp_joint_set_target / set_motor / set_limits`, `gp_joint_angle / translation` read and drive them). They are
+solved on the CPU in position form, a few passes a step (`gp_set_joint_iterations`), on top of the circle solver: a **box** is one rigid body
+(mass and inertia from its circles), a ball or one circle of a rope is a node with its own spin
+(see below), so a revolute anchor may sit off a ball's centre; angle limits and motors need a box or polygon. Joined bodies do not collide with each other (a chain of joints is one collision group) unless
+`collide_connected`. `runtime/test_gpuphys.c` checks each type against its physics: a hinge keeps its pin within 0.002, a limit holds a plank up, a
+motor turns at its speed, a slider stops at its limit, a 1 Hz suspension sags to 0.23 (theory 0.25), a rope stops a fall at its length.
+
+### Rotation and polygons (C runtime)
+
+A **ball has a spin**: `gp_body_set_angle`, `gp_body_[add_|set_]angular_velocity` drive it, and on a tile it rolls toward the no-slip spin
+instead of just sliding. **`gp_add_polygon`** makes a convex polygon: a fill of circles kept rigid by shape matching, with the rigid
+velocity projected back so it keeps spinning and tumbling (`gp_body_origin` gives back the point it was made at). Tile friction acts on the
+slip speed `v.t - r*omega` through a per-circle `omega` binding of `tile_material`, so a rolling ball keeps rolling; this needs the material
+path (any `gp_body_set_material / filter / sensor` call), the legacy path still slows rolling balls. Polygons are rounded by their circle
+radius, and a coarse fill (a hexagon of 8 circles) rests within about 0.05 rad of a flat edge.
+
 ### Current limits of the kernels
 
-- Circles only; boxes, ropes and joints are circles plus constraints, rounded at the corners.
+- Circles only; boxes, polygons, ropes and joints are circles plus constraints, rounded at the corners.
 - Positions are interleaved `f32` pairs, y up; helper functions in the kernel language cannot take buffers.
 - The wgpu path of the Python host has been verified only on the reference interpreter so far.
 
