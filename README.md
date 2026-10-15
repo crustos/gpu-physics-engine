@@ -150,11 +150,36 @@ slip speed `v.t - r*omega` through a per-circle `omega` binding of `tile_materia
 path (any `gp_body_set_material / filter / sensor` call), the legacy path still slows rolling balls. Polygons are rounded by their circle
 radius, and a coarse fill (a hexagon of 8 circles) rests within about 0.05 rad of a flat edge.
 
+### In the browser: WebAssembly and WebGPU
+
+Two ways to run the engine in a page; the first has every feature, the second has the speed.
+
+**WebAssembly (`runtime/wasm`).** `python3 runtime/wasm/build.py --crust ../crust` compiles `gpuphys.c` and Crust's C translation of the kernels to
+`gpuphys.wasm` with plain clang (`--target=wasm32`, wasm-ld, no emscripten, no wasi-sdk; `libc.c` is the 150 lines of libc it needs, and `sinf`/`cosf`
+are imported from JavaScript's `Math`). `gpuphys.js` wraps the whole C header: bodies, polygons, material and filters, the joints, contact events, ray
+casts, sand and blasts. It runs on the CPU, so it suits a few hundred bodies and a few thousand grains. `python3 runtime/wasm/check.py --crust ../crust`
+builds it, builds the same scenario natively and runs `tests/test.mjs` in Node: both builds agree to three decimals (a tumbling hexagon differs by 0.02 rad, from
+JavaScript's `sin`/`cos`).
+
+**WebGPU (`web/`).** WebGPU takes WGSL, so `python3 build.py --wgsl` (which implies `--push-buffer`) also writes `NAME.wgsl` for each kernel file, converted from
+the SPIR-V by [naga](https://github.com/gfx-rs/wgpu/tree/trunk/naga) (`cargo install naga-cli --locked`; `tools/spv2wgsl.py`) and validated again after the
+two changes WebGPU needs: the scalar parameters become a `var<uniform>`, and `solve_collisions_filtered` fits the 10 storage buffers most adapters allow
+(its inverse masses live in the material array). `web/gpuphys_webgpu.js` is the engine's pipeline in JavaScript: integrate, grid, radix sort, collision
+cells, the coloured solver, joints, tiles, and the material path, in one command submission per step; `web/renderer.js` draws the circles and tiles from those
+buffers with no readback; `web/demo.html` is a small playground. Bodies are the circle clusters of the other hosts (balls, crates, ropes, sand); joints
+between bodies, contact events and polygons are CPU-side and stay in the WebAssembly build. `python3 web/check.py --crust ../crust` runs `web/test.html` in
+headless Chromium (WebGPU on SwiftShader, no GPU needed): a ball and a crate come to rest, sand settles, a rope hangs, rubber bounces, masks and sensors
+pass through, a body can be removed, 4000 grains step. Needs Playwright for Node.
+
+Two things the browser run taught: a short-circuit `||` around a buffer load in `tile_collide` made SwiftShader compile it for 74 seconds (now 15, no driver
+has complained), and Chromium's headless SwiftShader loses the WebGPU device as soon as a *canvas* is presented, so the tests read back offscreen textures
+(`Renderer.snapshot()`); a real browser is not affected.
+
 ### Current limits of the kernels
 
 - Circles only; boxes, polygons, ropes and joints are circles plus constraints, rounded at the corners.
 - Positions are interleaved `f32` pairs, y up; helper functions in the kernel language cannot take buffers.
-- The wgpu path of the Python host has been verified only on the reference interpreter so far.
+- The wgpu path of the Python host has been verified only on the reference interpreter so far; the WebGPU host runs on SwiftShader (software Vulkan) in the tests, not yet on a hardware GPU.
 
 ## 📊 Performance
 

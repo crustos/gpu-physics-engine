@@ -158,9 +158,14 @@ def main(argv):
                          "storage buffer (binding 30) instead of push "
                          "constants: no device feature needed, and what the "
                          "wgpu / WebGPU hosts use")
+    ap.add_argument("--wgsl", action="store_true",
+                    help="also write NAME.wgsl for WebGPU (implies --push-buffer; needs the naga "
+                         "command line tool, see tools/spv2wgsl.py)")
     ap.add_argument("--strict", action="store_true",
                     help="exit 1 while any compute shader is still unported")
     a = ap.parse_args(argv)
+    if a.wgsl:
+        a.push_buffer = True
 
     a.out = os.path.abspath(a.out)
     crust = find_crust(a.crust)
@@ -215,6 +220,15 @@ def main(argv):
     with open(os.path.join(a.out, "manifest.json"), "w") as fh:
         json.dump(manifest, fh, indent=2)
         fh.write("\n")
+
+    if a.wgsl and not failed:
+        sys.path.insert(0, os.path.join(HERE, "tools"))
+        import spv2wgsl
+        try:
+            spv2wgsl.convert(a.out)
+        except spv2wgsl.WgslError as e:
+            print("  FAIL  wgsl: %s" % e)
+            failed += 1
 
     print("\n%d of %d kernel files built in %.1fs"
           % (len(sources) - failed, len(sources), time.time() - t0))
