@@ -33,6 +33,11 @@ void solve_collisions_filtered( unsigned int *chunk_obj_count, unsigned int *col
 void tile_material( float *positions, float *previous, float *radius, unsigned int *tiles, float *material,
 					float *omega, unsigned int tw, unsigned int th, unsigned int n, float tile_friction,
 					float tile_bounciness, float bounce_threshold ) __attribute__( ( weak ) );
+/* kernels/prowl_curves.rs (gpk_prowl_curves.c): quadratic Bezier colliders. Weak like the material kernels. */
+void curve_collide( float *positions, float *previous, float *radius, float *material, float *curves,
+					unsigned int n, unsigned int ncurves ) __attribute__( ( weak ) );
+void curve_material( float *positions, float *previous, float *radius, float *material, float *omega, float *curves,
+					 unsigned int n, unsigned int ncurves, float bounce_threshold ) __attribute__( ( weak ) );
 void raycast( float *positions, float *radius, unsigned int *groups, unsigned int *tiles, float *rays, float *hits,
 			  unsigned int *hit_ids, unsigned int tw, unsigned int th, unsigned int ncircles, unsigned int nrays,
 			  unsigned int mask, unsigned int ignore_group );
@@ -137,6 +142,8 @@ struct GpWorld
 	float last_dt;
 	BJoint *bj;                      /* joints between bodies (gp_add_body_joint) */
 	int nbj, bj_cap, joint_iters;
+	float *curves;                   /* Bezier colliders, 16 floats each (kernels/prowl_curves.rs) */
+	int ncurves, curve_cap;
 	int use_material;                /* a body set a material or a filter: the step uses prowl_material's kernels */
 	float bounce_threshold;          /* world units / s: slower approaches do not bounce */
 	float tile_bounce;               /* the tiles' bounciness (gp_set_material), 0 by default as in Unity */
@@ -236,7 +243,7 @@ void gp_destroy( GpWorld *w )
 	free( w->pos ), free( w->prev ), free( w->rad ), free( w->tags ), free( w->groups ), free( w->owner );
 	free( w->mat ), free( w->invm ), free( w->dens ), free( w->drag ), free( w->flt ), free( w->custom ), free( w->uflt ), free( w->sensor ), free( w->ang ), free( w->omega ), free( w->prev_ang ), free( w->spin ), free( w->ct ), free( w->ev ), free( w->bj );
 	free( w->frozen ), free( w->pinned ), free( w->pin_pos ), free( w->frozen_pos ), free( w->saved_rad ), free( w->cell_ids ), free( w->object_ids ), free( w->chunks );
-	free( w->cells ), free( w->tmp ), free( w->tiles ), free( w->joints ), free( w->ji ), free( w->jf );
+	free( w->curves ), free( w->cells ), free( w->tmp ), free( w->tiles ), free( w->joints ), free( w->ji ), free( w->jf );
 	free( w->batch_first ), free( w->batch_count ), free( w->bodies );
 	free( w );
 }
@@ -710,6 +717,47 @@ int gp_body_set_material( GpWorld *w, int body, float friction, float bounciness
 		w->drag[c] = drag < 0 ? 0 : drag;
 	}
 	return 1;
+}
+
+/* A static quadratic Bezier collider p0 -> p1 (control) -> p2, in world units. side 0 is a thin wall (solid on
+ * both faces: a circle stays on the face it came from), +1 / -1 one edge of a solid contour whose inside is on
+ * the left / right of the direction p0 -> p2. friction is Unity's (0.4 default), bounciness 0..1; a contact
+ * uses the geometric mean of the two frictions and the larger bounciness. Returns the curve's index, or -1
+ * when the host linked no prowl_curves / prowl_material kernels. Sensor bodies are not filtered from curves. */
+int gp_add_curve( GpWorld *w, float x0, float y0, float x1, float y1, float x2, float y2, float friction,
+				  float bounciness, int side )
+{
+	if ( !curve_collide || !curve_material || !integrate_material || !solve_collisions_filtered || !tile_material )
+		return -1;
+	if ( w->ncurves == w->curve_cap )
+	{
+		w->curve_cap = w->curve_cap ? 2 * w->curve_cap : 16;
+		w->curves = realloc( w->curves, sizeof( float ) * 16 * w->curve_cap );
+	}
+	float *c = &w->curves[16 * w->ncurves];
+	x0 = ( x0 - w->ox ) / w->cell, y0 = ( y0 - w->oy ) / w->cell;
+	x1 = ( x1 - w->ox ) / w->cell, y1 = ( y1 - w->oy ) / w->cell;
+	x2 = ( x2 - w->ox ) / w->cell, y2 = ( y2 - w->oy ) / w->cell;
+	c[0] = x0, c[1] = y0, c[2] = x1, c[3] = y1, c[4] = x2, c[5] = y2;
+	/* the box of the control polygon holds the curve; the kernel grows it by the circle's radius */
+	c[6] = fminf( x0, fminf( x1, x2 ) ), c[7] = fminf( y0, fminf( y1, y2 ) );
+	c[8] = fmaxf( x0, fmaxf( x1, x2 ) ), c[9] = fmaxf( y0, fmaxf( y1, y2 ) );
+	c[10] = 0.375f * ( friction < 0 ? 0 : friction );
+	c[11] = bounciness < 0 ? 0 : ( bounciness > 1 ? 1 : bounciness );
+	c[12] = side > 0 ? 1.0f : ( side < 0 ? -1.0f : 0.0f );
+	c[13] = c[14] = c[15] = 0.0f;
+	w->use_material = 1;
+	return w->ncurves++;
+}
+
+void gp_clear_curves( GpWorld *w )
+{
+	w->ncurves = 0;
+}
+
+int gp_curve_count( const GpWorld *w )
+{
+	return w->ncurves;
 }
 
 /* Box2D's filter: this body is in the categories `category` (bits) and collides with those in `mask`;
@@ -1903,6 +1951,8 @@ void gp_step( GpWorld *w, float dt )
 			GP_LAUNCH( w->batch_count[b], solve_joints( w->pos, w->rad, w->ji, w->jf, w->batch_first[b], w->batch_count[b] ) );
 		if ( w->tw && w->th )
 			GP_LAUNCH( n, tile_collide( w->pos, w->rad, w->tiles, w->tw, w->th, n ) );
+		if ( w->ncurves )
+			GP_LAUNCH( n, curve_collide( w->pos, w->prev, w->rad, w->mat, w->curves, n, w->ncurves ) );
 		restore_pinned( w );
 	}
 	if ( w->tw && w->th && mat )
@@ -1910,6 +1960,9 @@ void gp_step( GpWorld *w, float dt )
 									 w->tile_bounce, w->bounce_threshold * dt / w->cell ) );
 	else if ( w->tw && w->th && ( w->friction > 0 || w->bounce_loss > 0 ) )
 		GP_LAUNCH( n, tile_friction( w->pos, w->prev, w->rad, w->tiles, w->tw, w->th, n, w->friction, w->bounce_loss ) );
+	if ( w->ncurves )
+		GP_LAUNCH( n, curve_material( w->pos, w->prev, w->rad, w->mat, w->omega, w->curves, n, w->ncurves,
+									  w->bounce_threshold * dt / w->cell ) );
 	for ( int bi = 0; bi < w->nbodies; ++bi )
 	{
 		Body *b = &w->bodies[bi];

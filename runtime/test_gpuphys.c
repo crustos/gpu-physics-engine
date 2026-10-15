@@ -577,6 +577,98 @@ static void rotation_test( void )
 	}
 }
 
+static float x_of( GpWorld *w, int body )
+{
+	float x, y, a;
+	gp_body_pose( w, body, &x, &y, &a );
+	return x;
+}
+
+/* Bezier colliders (kernels/prowl_curves.rs) */
+static void curves_test( void )
+{
+	/* a thin bowl: a ball dropped inside it settles at the lowest point, r above the curve */
+	{
+		GpWorld *w = gp_create( 256, 512, 0, 0, 20, 10, 1.0f, 0, -9.81f );
+		check( "a curve is accepted", gp_add_curve( w, 4, 6, 10, 2, 16, 6, 0.4f, 0, 0 ) == 0 );
+		int b = gp_add_ball( w, 8, 8, 0.5f, 0, 0, 1.0f / 60 );
+		for ( int s = 0; s < 600; ++s )
+			gp_step( w, 1.0f / 60 );
+		float x = x_of( w, b ), y = y_of( w, b );
+		printf( "     bowl: rests at (%.2f, %.2f)\n", x, y );
+		check( "a ball comes to rest in the bowl", fabsf( x - 10 ) < 1.2f && y > 4.45f && y < 4.75f );
+		gp_destroy( w );
+	}
+	/* the same bowl from underneath: a ball thrown up at it is stopped by the thin wall */
+	{
+		GpWorld *w = gp_create( 256, 512, 0, 0, 20, 10, 1.0f, 0, 0 );
+		gp_add_curve( w, 4, 6, 10, 2, 16, 6, 0.4f, 0, 0 );
+		int b = gp_add_ball( w, 10, 0.8f, 0.4f, 0, 6.0f, 1.0f / 60 );
+		for ( int s = 0; s < 120; ++s )
+			gp_step( w, 1.0f / 60 );
+		check( "a thin wall stops a ball from below", y_of( w, b ) < 3.75f && y_of( w, b ) > 2.0f );
+		gp_destroy( w );
+	}
+	/* a solid hill on the floor: balls dropped on its flanks roll off, and none ends up inside or on top */
+	{
+		GpWorld *w = world( -9.81f );
+		gp_add_curve( w, 2, 1, 6, 9, 10, 1, 0.4f, 0, -1 );     /* apex at (6, 5) */
+		const float xs[6] = { 3.5f, 4.5f, 5.0f, 7.0f, 7.5f, 8.5f };
+		int b[6];
+		for ( int i = 0; i < 6; ++i )
+			b[i] = gp_add_ball( w, xs[i], 9.0f - 1.2f * ( i % 3 ), 0.4f, 0, 0, 1.0f / 60 );
+		for ( int s = 0; s < 1500; ++s )
+			gp_step( w, 1.0f / 60 );
+		int low = 0, inside = 0;
+		for ( int i = 0; i < 6; ++i )
+		{
+			float x = x_of( w, b[i] ), y = y_of( w, b[i] );
+			low += y < 4.0f;
+			float t = ( x - 2 ) / 8, top = 1 + 16 * t * ( 1 - t );
+			inside += x > 2 && x < 10 && y < top - 0.2f;
+		}
+		printf( "     hill: %d of 6 balls came down, %d inside\n", low, inside );
+		check( "balls roll down a solid hill", low == 6 );
+		check( "no ball ends up inside the solid hill", inside == 0 );
+		gp_destroy( w );
+	}
+	/* bounciness and friction of a curve */
+	for ( int e = 0; e < 2; ++e )
+	{
+		GpWorld *w = gp_create( 256, 512, 0, 0, 20, 10, 1.0f, 0, -9.81f );
+		gp_add_curve( w, 2, 3, 10, 3, 18, 3, 0.4f, e ? 0.8f : 0.0f, 0 );
+		int b = gp_add_ball( w, 10, 8, 0.5f, 0, 0, 1.0f / 60 );
+		float lowest = 100, top = 0;
+		for ( int s = 0; s < 400; ++s )
+		{
+			gp_step( w, 1.0f / 60 );
+			float y = y_of( w, b );
+			if ( y < lowest )
+				lowest = y;
+			if ( y > lowest + 0.2f && y > top )
+				top = y;
+		}
+		printf( "     curve bounciness %.1f: rebound to %.2f\n", e ? 0.8f : 0.0f, top );
+		check( e ? "a bouncy curve throws the ball back up" : "a dead curve does not", e ? top > 4.0f : top < 3.9f );
+		gp_destroy( w );
+	}
+	{
+		float reach[2];
+		for ( int f = 0; f < 2; ++f )
+		{
+			GpWorld *w = gp_create( 256, 512, 0, 0, 40, 10, 1.0f, 0, -9.81f );
+			gp_add_curve( w, 1, 3, 20, 3, 39, 3, f ? 2.0f : 0.0f, 0, 0 );
+			int b = gp_add_ball( w, 2, 3.5f, 0.5f, 8.0f, 0, 1.0f / 60 );
+			for ( int s = 0; s < 90; ++s )
+				gp_step( w, 1.0f / 60 );
+			reach[f] = x_of( w, b );
+			gp_destroy( w );
+		}
+		printf( "     sliding 1.5 s from x=2 at 8 units/s: frictionless x %.2f, friction 2 x %.2f\n", reach[0], reach[1] );
+		check( "curve friction slows a sliding ball", reach[1] < reach[0] - 0.3f );
+	}
+}
+
 int main( void )
 {
 	setvbuf( stdout, 0, _IONBF, 0 );
@@ -666,6 +758,7 @@ int main( void )
 	events_test();
 	joints_test();
 	rotation_test();
+	curves_test();
 	printf( failed ? "%d FAILED\n" : "all checks passed\n", failed );
 	return failed ? 1 : 0;
 }

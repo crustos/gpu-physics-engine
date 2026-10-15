@@ -44,6 +44,9 @@ void gp_set_tiles( GpWorld *w, int width, int height, const unsigned *cells );
 int gp_add_ball( GpWorld *w, float x, float y, float radius, float vx, float vy, float dt );
 int gp_add_box( GpWorld *w, float x, float y, float width, float height, float angle, float vx, float vy,
 				float dt, float stiffness );
+int gp_add_curve( GpWorld *w, float x0, float y0, float x1, float y1, float x2, float y2, float friction, float bounciness, int side ); /* static quadratic Bezier collider (side 0 thin wall, +1/-1 solid contour: inside left/right); index, -1 without the prowl_curves kernels */
+void gp_clear_curves( GpWorld *w );
+int gp_curve_count( const GpWorld *w );
 int gp_add_sand( GpWorld *w, float x, float y, float radius, float vx, float vy, float dt ); /* a free circle (tag sand): returns its circle index, -1 when full */
 int gp_blast( GpWorld *w, float x, float y, float radius, float force ); /* pushes circles away: force = speed at the centre (units/s), linear to the edge */
 int gp_add_rope( GpWorld *w, float ax, float ay, float bx, float by, int segments, float radius, int pin_a, int pin_b );
