@@ -4,6 +4,7 @@
 <pre id="log">running...</pre>
 <script type="module">
 import { GpuWorld } from "./gpuphys_webgpu.js";
+import { Windfoil, windingAt, coverage, circleContour, polyContour, blobContour } from "./windfoil.js";
 const q = new URLSearchParams(location.search);
 const kernels = q.get("kernels") || "../spirv";
 const only = q.get("only");
@@ -41,6 +42,61 @@ async function main() {
       let worst = 0; let k = 0;
       for (const j of w.joints.values()) { const d = Math.hypot(pos[2 * j[0]] - pos[2 * j[1]], pos[2 * j[0] + 1] - pos[2 * j[1] + 1]); worst = Math.max(worst, Math.abs(d - rest[k++]) / rest[k - 1]); }
       check("...and keeps its shape", worst < 0.08, `worst joint error ${(100 * worst).toFixed(1)}%`);
+    },
+    async curves() {
+      const w = await make({ world: [12, 8] });
+      check("a Bezier collider is accepted", w.addCurve(2, 6, 6, 2, 10, 6, 0.4, 0, 0) === 0 && w.curveCount === 1);
+      const b = w.addBall(5, 7, 0.35);
+      await frames(w, 420);
+      const p = await w.bodyPosition(b);
+      check("a ball comes to rest in a bowl made of one curve", Math.abs(p.x - 6) < 1.2 && p.y > 4.3 && p.y < 4.65, `at (${p.x.toFixed(2)}, ${p.y.toFixed(2)})`);
+      // a solid hill on the floor: balls dropped on its flanks end up beside it, never inside
+      const h = await make({ world: [12, 8] }); h.setTileGrid(12, 8, floorTiles(12, 8));
+      h.addCurve(2, 1, 6, 9, 10, 1, 0.4, 0, -1);                 // apex (6, 5); the inside is below
+      const xs = [3.5, 4.5, 5.0, 7.0, 7.5, 8.5], ids = xs.map((x, i) => h.addBall(x, 7.4 - 1.2 * (i % 3), 0.4));
+      await frames(h, 900);
+      let down = 0, inside = 0;
+      for (const id of ids) {
+        const q = await h.bodyPosition(id), t = (q.x - 2) / 8, top = 1 + 16 * t * (1 - t);
+        down += q.y < 4; inside += q.x > 2 && q.x < 10 && q.y < top - 0.2;
+      }
+      check("balls roll down a solid hill and none is inside it", down === 6 && inside === 0, `down ${down}, inside ${inside}`);
+    },
+    async windfoil() {
+      const N = 64, view = 10, scale = N / view;
+      const target = device.createTexture({ size: [N, N], format: "rgba8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+      const rb = device.createBuffer({ size: N * N * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      const star = []; for (let i = 0; i < 5; i++) { const a = Math.PI / 2 + i * 4 * Math.PI / 5; star.push(5 + 4 * Math.cos(a), 5 + 4 * Math.sin(a)); }
+      const cases = [
+        ["a circle", [circleContour(5, 5, 3.2)], "nonzero"],
+        ["a ring", [circleContour(5, 5, 3.6), circleContour(5, 5, 2, 8, true)], "nonzero"],
+        ["a pentagram, even-odd", [polyContour(star)], "evenodd"],
+        ["a pentagram, nonzero", [polyContour(star)], "nonzero"],
+        ["a blob", [blobContour([2, 2, 8, 1.5, 9, 6, 5, 9, 1.5, 6.5])], "nonzero"],
+        ["two circles, even-odd", [circleContour(4, 5, 2.5), circleContour(6, 5, 2.5)], "evenodd"],
+      ];
+      for (const [name, path, rule] of cases) {
+        const wf = Windfoil.create(device, "rgba8unorm").setPath(path, { pad: 1 / scale });
+        const enc = device.createCommandEncoder();
+        const pass = enc.beginRenderPass({ colorAttachments: [{ view: target.createView(), clearValue: [0, 0, 0, 0], loadOp: "clear", storeOp: "store" }] });
+        wf.draw(pass, { camera: [5, 5], scale, res: [N, N], color: [1, 1, 1, 1], rule });
+        pass.end();
+        enc.copyTextureToBuffer({ texture: target }, { buffer: rb, bytesPerRow: N * 4 }, [N, N]);
+        device.queue.submit([enc.finish()]);
+        await rb.mapAsync(GPUMapMode.READ);
+        const px = new Uint8Array(rb.getMappedRange().slice(0)); rb.unmap();
+        let worst = 0, sum = 0, ink = 0, wi = 0, wj = 0, wref = 0, wgot = 0;
+        const ss = 10;
+        for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+          let acc = 0;                                           // supersampled reference; the texture's row 0 is the top (world y = 10)
+          for (let b = 0; b < ss; b++) for (let a = 0; a < ss; a++)
+            acc += windingAt(path, (i + (a + 0.5) / ss) / scale, view - (j + (b + 0.5) / ss) / scale);
+          const ref = coverage(acc / (ss * ss), rule), got = px[4 * (j * N + i) + 3] / 255;
+          const d = Math.abs(ref - got); if (d > worst) { worst = d; wi = i; wj = j; wref = ref; wgot = got; } sum += d; ink += got;
+        }
+        check(`windfoil fills ${name} like supersampling`, worst < 0.06 && sum / (N * N) < 0.001 && ink > 50, `worst ${worst.toFixed(3)} at (${wi},${wj}) ref ${wref.toFixed(3)} got ${wgot.toFixed(3)} mean ${(sum / (N * N)).toFixed(4)} ink ${ink.toFixed(0)}`);
+        wf.params.destroy();
+      }
     },
     async sand() {
       const w = await make(); w.setTileGrid(12, 8, floorTiles(12, 8));

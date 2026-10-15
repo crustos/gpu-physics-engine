@@ -137,6 +137,8 @@ export class GpuWorld {
     this.matDirty = true; this.matDt = null;
     this.paramPool = []; this.groupCache = new Map(); this.ids = new WeakMap(); this.idn = 0; this.slot = 0;
     this.bounceTile = null;
+    // Bezier colliders (kernels/prowl_curves.rs): 16 floats each
+    this.curveCap = 0; this.curveData = new Float32Array(0); this.nCurves = 0; this.curveBuf = buf(16, 0, "curves");
   }
 
   async prepare() {
@@ -144,9 +146,11 @@ export class GpuWorld {
       "prefix_sum_of_each_block", "prefix_sum_of_the_block_sums", "add_block_prefix_sums_to_the_buffer", "build_collision_cells_array",
       "solve_collisions_grouped", "solve_joints", "tile_collide", "tile_friction"];
     if (this.hasMaterialKernels()) need.push("integrate_material", "solve_collisions_filtered", "tile_material");
+    if (this.hasCurveKernels()) need.push("curve_collide", "curve_material");
     await Promise.all(need.map((e) => this.k.pipeline(e)));
   }
   hasMaterialKernels() { return ["integrate_material", "solve_collisions_filtered", "tile_material"].every((e) => this.k.has(e)); }
+  hasCurveKernels() { return this.hasMaterialKernels() && ["curve_collide", "curve_material"].every((e) => this.k.has(e)); }
   get cellSize() { return this.maxRadius * 2.2; }
   write(buffer, offset, data) { this.device.queue.writeBuffer(buffer, offset, data); }
 
@@ -293,6 +297,27 @@ export class GpuWorld {
     this.write(this.tiles, 0, data);
     this.tilesDims = [width | 0, height | 0];
   }
+
+  // ------------------------------------------------- Bezier colliders
+  /** A static quadratic Bezier collider p0 -> p1 (control) -> p2 in world units. side 0: a thin wall solid on both faces;
+   *  +1 / -1: one edge of a solid contour whose inside is on the left / right of the direction p0 -> p2.
+   *  friction is Unity's, bounciness 0..1. Returns the curve's index, or -1 when the kernels are missing. */
+  addCurve(x0, y0, x1, y1, x2, y2, friction = 0.4, bounciness = 0, side = 0) {
+    if (!this.hasCurveKernels()) return -1;
+    if (this.nCurves === this.curveCap) {
+      this.curveCap = Math.max(16, this.curveCap * 2);
+      const grown = new Float32Array(16 * this.curveCap); grown.set(this.curveData);
+      this.curveData = grown;
+      this.curveBuf = this.buf(4 * grown.length, 0, "curves"); this.groupCache.clear();
+    }
+    this.curveData.set([x0, y0, x1, y1, x2, y2, Math.min(x0, x1, x2), Math.min(y0, y1, y2), Math.max(x0, x1, x2), Math.max(y0, y1, y2),
+      FRICTION_UNIT * Math.max(0, friction), Math.min(1, Math.max(0, bounciness)), side > 0 ? 1 : side < 0 ? -1 : 0, 0, 0, 0], 16 * this.nCurves);
+    this.write(this.curveBuf, 0, this.curveData);
+    this.useMaterial = true; this.matDirty = true;
+    return this.nCurves++;
+  }
+  clearCurves() { this.nCurves = 0; }
+  get curveCount() { return this.nCurves; }
 
   // ----------------------------------------------- Box2D's per-body settings
   _circlesOf(body) { return this.bodies.get(body).circles; }
@@ -445,6 +470,7 @@ export class GpuWorld {
       for (const [first, count] of this.jointBatches)
         this._run(pass, "solve_joints", count, pack("uu", first, count), { positions: this.positions, radius: this.radius, joint_i: this.jointI, joint_f: this.jointF });
       if (haveTiles) this._run(pass, "tile_collide", n, pack("uuu", tw, th, n), { positions: this.positions, radius: this.radius, tiles: this.tiles });
+      if (this.nCurves) this._run(pass, "curve_collide", n, pack("uu", n, this.nCurves), { ...cs, material: this.materialBuf, curves: this.curveBuf });
     }
     if (haveTiles) {
       if (mat) this._run(pass, "tile_material", n, pack("uuufff", tw, th, n, this.friction, 1 - this.bounceLoss, this.bounceThreshold * dt),
@@ -452,6 +478,8 @@ export class GpuWorld {
       else if (this.friction > 0 || this.bounceLoss > 0) this._run(pass, "tile_friction", n, pack("uuuff", tw, th, n, this.friction, this.bounceLoss),
         { ...cs, tiles: this.tiles });
     }
+    if (this.nCurves) this._run(pass, "curve_material", n, pack("uuf", n, this.nCurves, this.bounceThreshold * dt),
+      { ...cs, material: this.materialBuf, omega: this.omegaBuf, curves: this.curveBuf });
     pass.end();
     this.device.queue.submit([enc.finish()]);
     this.steps++;
